@@ -1,5 +1,5 @@
-//! # Asynchronous IO Module
-//! - Provides a set of API on top of `oi_uring` kernel interface
+//! # Asynchronous I/O Module
+//! - Provides a set of API on top of Linux's `oi_uring` kernel interface
 //! - See - https://kernel.dk/io_uring.pdf
 //! - See - https://kernel.dk/axboe-kr2022.pdf
 //! - See - https://github.com/axboe/liburing/blob/master/src/include/liburing.h
@@ -7,8 +7,8 @@
 //! **Remarks:**
 //! - IO Uring is designed as a single-threaded SPSC ring buffer
 //! - Any thread synchronization must be managed explicitly by the App
-//! - We use `MPSC` queue wrapper for multi-threaded IO submission to `SQE`
-//! - IO completion `CQE` is done by the kernel and consumed by our ↻ Event Loop
+//! - We use `MPSC` queue wrapper for multi-threaded I/O submission to `SQE`
+//! - I/O completion `CQE` is done by the kernel and consumed by our ↻ EventLoop
 
 const std = @import("std");
 const mem = std.mem;
@@ -33,7 +33,7 @@ const Error = error { Overflow, Closed };
 
 const EventLoopStatus = enum { inactive, running, closing, closed };
 
-/// # SQE IO Operation Modes
+/// # I/O SQE Operation Modes
 /// - See section [5.1] and [5.2] on - https://kernel.dk/io_uring.pdf
 const Mode = enum(u8) {
     /// Waits for previous SQEs to be complete (A ← B ← C)
@@ -76,7 +76,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
             queue: MPSC(capacity)
         };
 
-        var so: ?SingletonObject(capacity) = null;
+        var so: ?SingletonObject = null;
+        var mio_syscall: [1]*OpWrapper = undefined;
         var gpa: ?std.heap.DebugAllocator(.{}) = null;
 
         const Self = @This();
@@ -95,36 +96,27 @@ pub fn AsyncIo(comptime capacity: u32) type {
             if (spot) Self.gpa = std.heap.DebugAllocator(.{}).init;
 
             const T = AsyncIo(capacity).SingletonObject;
-            Self.so = try Uring.setup(T, sfd, capacity, .{.debug = spot});
+            Self.so = try Uring.setup(T, capacity, sfd, .{.spot_leaks = spot});
         }
 
         /// # Destroys Asynchronous I/O Instance
         pub fn deinit() void {
-            debug.assert(linux.close(@intCast(Self.iso().ring_fd)) == 0);
+            const sop = Self.iso();
+            sop.heap.destroy(Self.mio_syscall[0]);
+            debug.assert(linux.close(@intCast(sop.ring_fd)) == 0);
             if (Self.gpa) |_| debug.assert(Self.gpa.?.deinit() == .ok);
         }
 
         /// # Internal Static Object
         pub fn iso() *SingletonObject { return &Self.so.?; }
 
-        /// # Returns I/O Executor's Status
-        pub fn status() EventLoopStatus { return Self.iso().status; }
-
-        /// # I/O Submission Watcher
-        pub fn watch() !void {
-            const data: OpData = .poll_add {
-                .fd = Self.iso().sfd,
-                .mask = linux.POLL.IN,
-                .mode = .io_async
-            };
-
-            try Self.submit(data);
-        }
-
         /// Read from a File Descriptor at a Given Offset
-        pub fn read(op: Read, callback: ?OpHandler, data: ?*anyopaque) !void {
+        pub fn read(callback: ?OpHandler, data: ?*anyopaque, op: Read) !void {
             try submit(OpData {.read = op}, callback, data);
         }
+
+        /// # Returns I/O Executor's Status
+        fn status() EventLoopStatus { return Self.iso().status; }
 
         /// # Submits a New I/O Operation
         fn submit(op: OpData, handle: ?OpHandler, data: ?*anyopaque) !void {
@@ -144,10 +136,61 @@ pub fn AsyncIo(comptime capacity: u32) type {
             Signal.Linux.signalEmit(linux.SIG.USR1);
         }
 
-        /// # Flushes Pending I/O Operations
-        /// **Remarks:** Waiting on completion gets interrupted by `submit()`
-        /// - Submits consumed I/O to the SQE for completion
-        /// - Waits for pending I/O completion when queue is empty!
+        /// # Starts the I/O Event Loop for Execution
+        pub fn eventLoop() !void {
+            const sop = Self.iso();
+
+            log.info(
+                "Async I/O event loop is running on [SQ-{d} | CQ-{d}]",
+                .{sop.sq_ring.mask.* + 1, sop.cq_ring.mask.* + 1}
+            );
+
+            try Self.watch();
+            sop.status = .running;
+
+            while(true) {
+                try Self.flush();    // Submitted I/O
+                try Self.reapCqes(); // Completed I/O
+
+                switch (sop.status) {
+                    .inactive => unreachable,
+                    .running => {
+                        if (Signal.iso().signal > 0) sop.status = .closing;
+                    },
+                    .closing => {
+                        // Runs one last time for any remaining ops
+                        Signal.Linux.signalEmit(linux.SIG.USR1);
+                        sop.status = .closed;
+                    },
+                    .closed => break
+                }
+            }
+        }
+
+        /// # Watches for any I/O Submission
+        fn watch() !void {
+            const sop = Self.iso();
+            const data = PollAdd {.fd = sop.sfd, .mask = linux.POLL.IN};
+            const op_data = OpData {.poll_add = data};
+
+            const io_op = try sop.heap.create(OpWrapper);
+            errdefer sop.heap.destroy(io_op);
+
+            io_op.* = OpWrapper {.op = op_data, .handle = null, .data = null };
+
+            Self.mio_syscall[0] = io_op;
+
+            const entry: usize = @intFromPtr(io_op);
+            _ = sop.queue.push(entry) orelse return Error.Overflow;
+
+            // Notifies the watcher
+            Signal.Linux.signalEmit(linux.SIG.USR1);
+        }
+
+        /// # Flushes Pending I/O Operations to the SQE
+        /// - Submits consumed op to the SQE for completion
+        /// - Sleeps when waiting on CQE completions or idle
+        /// - Wakes up when `submit()` is called for a new op
         fn flush() !void {
             var count: u32 = 0;
             const sop = Self.iso();
@@ -166,70 +209,98 @@ pub fn AsyncIo(comptime capacity: u32) type {
             if (res != 0 and res != -4) utils.syscallError(res, @src());
         }
 
+        /// # Consumes and Dispatches Completed I/O from CQEs
+        fn reapCqes() !void {
+            while (Self.getCqe()) |cqe| {
+                // Checks multishot I/O
+                const cqe_flags = cqe.flags & CQE_F_MORE;
+                const mio = if (cqe_flags == CQE_F_MORE) true else false;
+
+                const sop = Self.iso();
+                switch (cqe.user_data) {
+                    0 => if (cqe.res < 0) utils.syscallError(cqe.res, @src()),
+                    1 => {
+                        // PollAdd signal handler - Consume the emitted signal
+                        var info = mem.zeroes(SigInfo);
+                        _ = linux.read(3, mem.asBytes(&info), @sizeOf(SigInfo));
+                    },
+                    else => {
+                        std.debug.print("what's goint on", .{});
+                        const p: *OpWrapper = @ptrFromInt(cqe.user_data);
+                        std.debug.print("{any}\n", .{p.*});
+                        if (p.handle) |callback| callback(cqe.res, p.data)
+                        else {
+                            std.debug.print("why   what's goint on", .{});
+                            // Captures error for *null** callbacks
+                            if (cqe.res < 0) {
+                                utils.syscallError(cqe.res, @src());
+                            }
+                        }
+
+                        if (!mio) sop.heap.destroy(p);
+                    }
+                }
+            }
+        }
+
         fn submitToSqe(entry: usize) !void {
-            const io_op: *OpWrapper = @ptrFromInt(entry);
+            const io: *OpWrapper = @ptrFromInt(entry);
 
-            // should destroy on reapSqes instead
-            // destroy when calling the final callback
-            // defer Self.iso().heap.destroy(io);
+            var prep = Self.prepSqe();
+            const op_ptr = @as(?*anyopaque, io);
 
-            const prep = Self.prepSqe();
-            const op_ptr = @as(?*anyopaque, io_op);
-
-            // here userdata is io_wrapper
-
-            switch(io_op.data.code()) {
+            switch(OpData.code(&io.op)) {
                 .PollAdd => {
-                    const d: PollAdd = io_op.data.poll_add;
+                    const d: PollAdd = io.op.poll_add;
                     Syscall.pollAdd(&prep, d.fd, d.mask, d.mode);
                 },
                 .Timeout => {
-                    const d: Timeout = io_op.data.timeout;
+                    const d: Timeout = io.op.timeout;
                     Syscall.timeout(&prep, op_ptr, d.ts, d.mode);
                 },
                 .Accept => {
-                    const d: Accept = io_op.data.accept;
+                    const d: Accept = io.op.accept;
                     Syscall.accept(
                         &prep, op_ptr, d.fd, d.addr, d.len, d.mode
                     );
                 },
-                .shutdown => {
-                    const d: Shutdown = io_op.data.shutdown;
+                .Shutdown => {
+                    const d: Shutdown = io.op.shutdown;
                     Syscall.shutdown(&prep, op_ptr, d.fd, d.mode);
                 },
-                .open => {
-                    const d: Open = io_op.data.open;
+                .Open => {
+                    const d: Open = io.op.open;
                     Syscall.open(
                         &prep, op_ptr, d.path, d.flags, d.open_mode, d.mode
                     );
                 },
-                .close => {
-                    const d: Close = io_op.data.close;
+                .Close => {
+                    const d: Close = io.op.close;
                     Syscall.close(&prep, op_ptr, d.fd, d.mode);
                 },
 
-                .send => {
-                    const d: Send = io_op.data.send;
+                .Send => {
+                    const d: Send = io.op.send;
                     Syscall.send(&prep, op_ptr, d.fd, d.buff, d.len, d.mode);
                 },
-                .recv => {
-                    const d: Recv = io_op.data.recv;
+                .Recv => {
+                    const d: Recv = io.op.recv;
                     Syscall.recv(&prep, op_ptr, d.fd, d.buff, d.len, d.mode);
                 },
-                .read => {
-                    const d: Read = io_op.data.read;
+                .Read => {
+                    const d: Read = io.op.read;
                     Syscall.read(
                         &prep, op_ptr, d.fd, d.buff, d.count, d.offset, d.mode
                     );
                 },
-                .write => {
-                    const d: Write = io_op.data.write;
+                .Write => {
+                    const d: Write = io.op.write;
                     Syscall.write(
                         &prep, op_ptr, d.fd, d.buff, d.count, d.offset, d.mode
                     );
                 },
-                .status => {
-                    const d: Status = io_op.data.status;
+                .Status => {
+                    const d: Status = io.op.status;
                     Syscall.status(
                         &prep, op_ptr, d.path, d.flags, d.mask, d.result, d.mode
                     );
@@ -239,8 +310,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
             try Self.updateSqe(&prep);
         }
 
-        /// # Prepares I/O Submission for SQE
-        /// - Returns a pointer to fill in the `SQE` entries for an I/O op.
+        /// # Prepares I/O Submission
+        /// - Returns a pointer to fill in an SQE for an operation
         fn prepSqe() PrepData {
             const sop = Self.iso();
             const tail = sop.sq_ring.tail.*;
@@ -260,7 +331,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
             sop.sq_ring.tail.* = pd.tail + 1;
         }
 
-        /// # Submits Batched SQE's for Completion
+        /// # Submits Batched SQEs for Completion
         fn pushSqes(batch_len: u32) void {
             const sop = Self.iso();
             const flags = sop.sq_ring.flags.*;
@@ -285,70 +356,6 @@ pub fn AsyncIo(comptime capacity: u32) type {
             sop.cq_ring.head.* = head + 1;
             return cqe;
         }
-
-        /// # Starts I/O Event Loop
-        /// **Remarks:** When executor returns `Error.Halting` upon closing
-        /// Tasks gets dispatched on the main thread.
-        pub fn eventLoop() !void {
-            const sop = Self.iso();
-
-            log.info(
-                "Event Loop is running on a [SQ-{d} | CQ-{d}] with Executor!",
-                .{sop.sq_ring.mask.* + 1, sop.cq_ring.mask.* + 1}
-            );
-
-            sop.status = .running;
-
-            while(true) {
-                try Self.flush();    // Submitted I/O
-                try Self.reapCqes(); // Completed I/O
-
-                switch (sop.status) {
-                    .inactive => unreachable,
-                    .running => {
-                        if (Signal.iso().signal > 0) {
-                            sop.status = .closing;
-                        }
-                    },
-                    .closing => {
-                        Signal.Linux.signalEmit(linux.SIG.USR1);
-                        sop.status = .closed;
-                    },
-                    .closed => break
-                }
-            }
-        }
-
-        /// # Consumes Completed CQEs for Deferred I/O Response
-        pub fn reapCqes() !void {
-            while (Self.getCqe()) |cqe| {
-                // Checks multishot I/O
-                const cqe_flags = cqe.flags & CQE_F_MORE;
-                const mio = if (cqe_flags == CQE_F_MORE) true else false;
-
-                const sop = Self.iso();
-                switch (cqe.user_data) {
-                    0 => if (cqe.res < 0) utils.syscallError(cqe.res, @src()),
-                    1 => {
-                        // PollAdd signal handler - Consume the emitted signal
-                        var info = mem.zeroes(SigInfo);
-                        _ = linux.read(3, mem.asBytes(&info), @sizeOf(SigInfo));
-                    },
-                    else => {
-                        const p: *OpWrapper = @ptrFromInt(cqe.user_data);
-                        if (p.handle) |callback| callback(cqe.res, p.data)
-                        else {
-                            // Captures error for *null** callbacks
-                            if (cqe.res < 0) {
-                                utils.syscallError(cqe.res, @src());
-                            }
-                        }
-
-                        if (!mio) sop.heap.destroy(p);
-                    }
-                }
-            }
-        }
     };
 }
 
@@ -359,50 +366,50 @@ pub fn AsyncIo(comptime capacity: u32) type {
 const PollAdd = struct {
     fd: i32,
     mask: u32,
-    mode: linux.mode_t = .io_async
+    mode: Mode = .io_async
 };
 
 const Timeout = struct {
     ts: *linux.timespec,
-    mode: linux.mode_t = .io_async
+    mode: Mode = .io_async
 };
 
 const Accept = struct {
     fd: i32,
     addr: *linux.sockaddr,
     len: *linux.socklen_t,
-    mode: linux.mode_t = .io_async
+    mode: Mode = .io_async
 };
 
 const Shutdown = struct {
     fd: i32,
-    mode: linux.mode_t = .io_async
+    mode: Mode = .io_async
 };
 
 const Open = struct {
     path: []const u8,
     flags: i32,
     open_mode: linux.mode_t,
-    mode: linux.mode_t = .io_async
+    mode: Mode = .io_async
 };
 
 const Close = struct {
     fd: i32,
-    mode: linux.mode_t = .io_async
+    mode: Mode = .io_async
 };
 
 const Send = struct {
     fd: i32,
     buff: []const u8,
     len: usize,
-    mode: linux.mode_t = .io_async
+    mode: Mode = .io_async
 };
 
 const Recv = struct {
     fd: i32,
     buff: []u8,
     len: usize,
-    mode: linux.mode_t = .io_async
+    mode: Mode = .io_async
 };
 
 const Read = struct {
@@ -410,7 +417,7 @@ const Read = struct {
     buff: []u8,
     count: usize,
     offset: usize,
-    mode: linux.mode_t = .io_async
+    mode: Mode = .io_async
 };
 
 const Write = struct {
@@ -418,7 +425,7 @@ const Write = struct {
     buff: []const u8,
     count: usize,
     offset: usize,
-    mode: linux.mode_t = .io_async
+    mode: Mode = .io_async
 };
 
 const Status = struct {
@@ -426,11 +433,12 @@ const Status = struct {
     flags: i32,
     mask: u32,
     result: *linux.Statx,
-    mode: linux.mode_t = .io_async
+    mode: Mode = .io_async
 };
 
 /// # Supported I/O Operations
-/// **For implementing a new I/O operation do the following:**
+/// To implement a new operation do the following:
+///
 /// - Add the new I/O data structure above and include here as follows
 /// - Capture that new I/O operation in `submitToSqe()`'s switch prong
 /// - Add `io_uring` syscall implementation at the `Syscall` structure
@@ -461,7 +469,7 @@ const OpData = union(enum) {
     write:    Write,
     status:   Status,
 
-    pub fn code(self: *OpData) Op {
+    fn code(self: *OpData) Op {
         return switch (self.*) {
             .poll_add => .PollAdd,
             .timeout =>  .Timeout,
@@ -837,7 +845,7 @@ const IoUringSqe = extern struct {
 };
 
 /// # Configuration Options
-pub const Cfg = struct {
+const Cfg = struct {
     /// Detects memory leaks when true
     spot_leaks: bool,
     /// Standalone kernel thread backend
@@ -847,7 +855,7 @@ pub const Cfg = struct {
 };
 
 /// # IO Uring Initialization
-pub const Uring = struct {
+const Uring = struct {
     /// Describes the offsets of various SQ ring buffer fields
     const IoSqringOffsets = extern struct {
         head: u32,
@@ -899,10 +907,12 @@ pub const Uring = struct {
     /// - `sfd` - SignalFD for the `submitWatcher()`
     /// = `cap` - Total capacity of the underlying MPSC queue
     /// - `cfg` - Additional configuration options for `io_uring` interface
-    pub fn setup(comptime T: type, sfd: i32, cap: u32, cfg: Cfg) !T {
+    fn setup(comptime T: type, comptime cap: u32, sfd: i32, cfg: Cfg) !T {
         // Ensures that the currently installed OS kernel supports
         // all `io_uring` operations that are defined in this file.
-        const uts = linux.uname();
+        var uts: linux.utsname = undefined;
+        _ = linux.uname(&uts);
+
         const version = try utils.parseDirtySemver(&uts.release);
         const sem_ver = SemVer {.major = 6, .minor = 8, .patch = 0};
         if (version.order(sem_ver) == .lt) {

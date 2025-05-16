@@ -1,4 +1,5 @@
 //! # App Interrupt Signal Handler Module
+//! 
 //! - Provides a set of utilities for interrupt register and participants
 //!
 //! NOTE: Only the detached threads (worker) are eligible to participate!

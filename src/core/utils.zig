@@ -1,3 +1,5 @@
+//! # Utility Module
+
 const std = @import("std");
 const log = std.log;
 const linux = std.os.linux;
@@ -20,7 +22,7 @@ pub fn targetPlatform(comptime tag: std.Target.Os.Tag) void {
 pub fn syscallError(code: i32, src: SrcLoc) void {
     const err: linux.E = @enumFromInt(@as(u16, @truncate(@abs(code))));
     const fmt_str = "Syscall - Errno {d} E{s} occurred in {s} at line {d}";
-    log.err(fmt_str, .{code, @tagName(err)}, null, src.file, src.line);
+    log.err(fmt_str, .{code, @tagName(err), src.file, src.line});
 }
 
 /// # Std SemanticVersion Alternative

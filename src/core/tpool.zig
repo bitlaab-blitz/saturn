@@ -62,6 +62,10 @@ pub fn Executor(comptime capacity: u32) type {
         pub fn init(worker: ?u16, detect_mem_leaks: bool) !void {
             if (Self.so != null) @panic("Initialize Only Once Per Process!");
 
+            // Ignores `USR1` - AsyncIo emits this for I/O submission
+            var sig = [_]u6{std.os.linux.SIG.USR1};
+            _ = Signal.Linux.signalMask(&sig);
+
             const cpu_threads: u16 = @intCast(try Thread.getCpuCount());
             const threads = worker orelse cpu_threads;
             if (threads == 0) @panic("Need at Least One or More Workers!");
@@ -95,7 +99,7 @@ pub fn Executor(comptime capacity: u32) type {
             }
 
             log.info(
-                "Executor is running on a [SQ-{d}] with {d} Threads!",
+                "Executor is running on [SQ-{d}] with {d} Threads",
                 .{capacity, sop.worker}
             );
         }
