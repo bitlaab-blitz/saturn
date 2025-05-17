@@ -44,6 +44,8 @@ const Mode = enum(u8) {
     io_async = linux.IOSQE_ASYNC
 };
 
+const Any = ?*anyopaque;
+
 //##############################################################################
 //# HIGH LEVEL ASYNCHRONOUS I/O INTERFACE -------------------------------------#
 //##############################################################################
@@ -110,13 +112,55 @@ pub fn AsyncIo(comptime capacity: u32) type {
         /// # Internal Static Object
         pub fn iso() *SingletonObject { return &Self.so.?; }
 
-        /// Read from a File Descriptor at a Given Offset
-        pub fn read(callback: ?OpHandler, data: ?*anyopaque, op: Read) !void {
+        /// # Sleeps for a Specified Duration
+        pub fn timeout(callback: ?OpHandler, data: Any, op: Timeout) !void {
+            try submit(OpData {.timeout = op}, callback, data);
+        }
+
+        /// # Accepts New Connection on a Socket
+        pub fn accept(callback: ?OpHandler, data: Any, op: Accept) !void {
+            try submit(OpData {.accept = op}, callback, data);
+        }
+
+        /// # Shuts Down a Socket Connection
+        pub fn shutdown(callback: ?OpHandler, data: Any, op: Shutdown) !void {
+            try submit(OpData {.shutdown = op}, callback, data);
+        }
+
+        /// # Open and Possibly Create a File
+        pub fn open(callback: ?OpHandler, data: Any, op: Open) !void {
+            try submit(OpData {.open = op}, callback, data);
+        }
+
+        /// # Closes a File Descriptor
+        pub fn close(callback: ?OpHandler, data: Any, op: Close) !void {
+            try submit(OpData {.close = op}, callback, data);
+        }
+
+        /// # Sends a Message on a Socket
+        pub fn send(callback: ?OpHandler, data: Any, op: Send) !void {
+            try submit(OpData {.send = op}, callback, data);
+        }
+
+        /// # Receives a Message from a Socket
+        pub fn recv(callback: ?OpHandler, data: Any, op: Recv) !void {
+            try submit(OpData {.recv = op}, callback, data);
+        }
+
+        /// # Reads from a File Descriptor at a Given Offset
+        pub fn read(callback: ?OpHandler, data: Any, op: Read) !void {
             try submit(OpData {.read = op}, callback, data);
         }
 
-        /// # Returns I/O Executor's Status
-        fn status() EventLoopStatus { return Self.iso().status; }
+        /// # Writes to a File Descriptor at a Given Offset
+        pub fn write(callback: ?OpHandler, data: Any, op: Write) !void {
+            try submit(OpData {.write = op}, callback, data);
+        }
+
+        /// # Gets Extended File Status
+        pub fn status(callback: ?OpHandler, data: Any, op: Status) !void {
+            try submit(OpData {.status = op}, callback, data);
+        }
 
         /// # Submits a New I/O Operation
         fn submit(op: OpData, handle: ?OpHandler, data: ?*anyopaque) !void {
@@ -225,12 +269,9 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         _ = linux.read(3, mem.asBytes(&info), @sizeOf(SigInfo));
                     },
                     else => {
-                        std.debug.print("what's goint on", .{});
                         const p: *OpWrapper = @ptrFromInt(cqe.user_data);
-                        std.debug.print("{any}\n", .{p.*});
                         if (p.handle) |callback| callback(cqe.res, p.data)
                         else {
-                            std.debug.print("why   what's goint on", .{});
                             // Captures error for *null** callbacks
                             if (cqe.res < 0) {
                                 utils.syscallError(cqe.res, @src());
@@ -255,8 +296,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
                     Syscall.pollAdd(&prep, d.fd, d.mask, d.mode);
                 },
                 .Timeout => {
-                    const d: Timeout = io.op.timeout;
-                    Syscall.timeout(&prep, op_ptr, d.ts, d.mode);
+                    var d: Timeout = io.op.timeout;
+                    Syscall.timeout(&prep, op_ptr, &d.ts, d.mode);
                 },
                 .Accept => {
                     const d: Accept = io.op.accept;
@@ -370,7 +411,7 @@ const PollAdd = struct {
 };
 
 const Timeout = struct {
-    ts: *linux.timespec,
+    ts: linux.timespec,
     mode: Mode = .io_async
 };
 
@@ -574,22 +615,6 @@ const Syscall = struct {
         pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
-    /// # Issues the Equivalent of a `close(2)` Syscall
-    /// - See - https://man7.org/linux/man-pages/man2/close.2.html
-    /// - Set the `flags` field of `close(2)` in `sqe.union_3.msg_flags`
-    fn close(pd: *PrepData, p: ?*anyopaque, fd: i32, io_mode: Mode) void {
-        pd.sqe.opcode = linux.IORING_OP.CLOSE;
-        pd.sqe.fd = fd;
-        pd.sqe.flags = @intFromEnum(io_mode);
-        pd.sqe.ioprio = 0;
-        pd.sqe.union_1.off = 0;
-        pd.sqe.union_2.addr = 0;
-        pd.sqe.len = 0;
-        pd.sqe.union_3.msg_flags = 0;
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
-    }
-
     /// # Issues the Equivalent of a `openat(2)` Syscall
     /// - See - https://man7.org/linux/man-pages/man2/openat.2.html
     /// - Set the `flags` field of `openat(2)` in `sqe.union_3.open_flags`
@@ -609,6 +634,22 @@ const Syscall = struct {
         pd.sqe.union_2.addr = @intFromPtr(path.ptr);
         pd.sqe.len = mode;
         pd.sqe.union_3.open_flags = @bitCast(flags);
+        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
+        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
+    }
+
+    /// # Issues the Equivalent of a `close(2)` Syscall
+    /// - See - https://man7.org/linux/man-pages/man2/close.2.html
+    /// - Set the `flags` field of `close(2)` in `sqe.union_3.msg_flags`
+    fn close(pd: *PrepData, p: ?*anyopaque, fd: i32, io_mode: Mode) void {
+        pd.sqe.opcode = linux.IORING_OP.CLOSE;
+        pd.sqe.fd = fd;
+        pd.sqe.flags = @intFromEnum(io_mode);
+        pd.sqe.ioprio = 0;
+        pd.sqe.union_1.off = 0;
+        pd.sqe.union_2.addr = 0;
+        pd.sqe.len = 0;
+        pd.sqe.union_3.msg_flags = 0;
         pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
         pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
