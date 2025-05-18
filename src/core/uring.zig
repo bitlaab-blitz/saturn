@@ -162,6 +162,9 @@ pub fn AsyncIo(comptime capacity: u32) type {
             try submit(OpData {.status = op}, callback, data);
         }
 
+        /// # Returns the Current Event Loop Status
+        pub fn evlStatus() EventLoopStatus { return Self.iso().status; }
+
         /// # Submits a New I/O Operation
         fn submit(op: OpData, handle: ?OpHandler, data: ?*anyopaque) !void {
             const sop = Self.iso();

@@ -6,7 +6,7 @@
 
 ## Platform Support
 
-Saturn has cross-platform support because of std.json module.
+Saturn has cross-platform support.
 
 ## Dependency
 
