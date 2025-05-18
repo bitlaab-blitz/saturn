@@ -44,8 +44,11 @@ pub fn register(sig: i32) callconv(.C) void {
 /// # Graceful App Shutdown
 /// - `res` - Should always be equal to the participants of the signal
 /// - `WARNING` - Incorrect participant response will create an infinite loop!
-pub fn terminate(res: i64) void {
+pub fn terminate(cond: std.Thread.Condition, res: i64) void {
+    std.debug.print("Captured signal {d}\n", .{res});
+    cond.broadcast();
     const sop = Self.iso();
+
     if (sop.signal > 0) {
         while(true) {
             if (sop.participant == res) {
