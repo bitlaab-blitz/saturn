@@ -197,7 +197,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
         }
 
         /// # Starts the I/O Event Loop for Execution
-        /// - `callbacks` - Runs on exit, before closing the event loop.
+        /// - `l` - Length of the callbacks array at compile time
+        /// - `callbacks` - Runs on exit, before closing the event loop
         pub fn eventLoop(comptime l: u8, callbacks: ?[l]ExitCallback) !void {
             const sop = Self.iso();
 
@@ -229,7 +230,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         sop.status = .closed;
 
                         // perhaps a 1sec sleep can gather all pending I/Os
-
+                        std.time.sleep(std.time.ns_per_s);
 
                     },
                     .closed => break
