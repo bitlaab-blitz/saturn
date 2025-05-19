@@ -77,12 +77,12 @@ pub fn AsyncIo(comptime capacity: u32) type {
             status: EventLoopStatus,
             heap: mem.Allocator,
             queue: MPSC(capacity),
-            pending_kernel_ios: u32 = 0
+            ongoing_ios: u32 = 0
         };
 
         var so: ?SingletonObject = null;
         var gpa: ?std.heap.DebugAllocator(.{}) = null;
-        var mio_syscall: [2]?*OpWrapper = [_]?*OpWrapper { null } ** 2;
+        var mio_pull_add: ?*OpWrapper = null;
 
         const Self = @This();
 
@@ -106,10 +106,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
         /// # Destroys Asynchronous I/O Instance
         pub fn deinit() void {
             const sop = Self.iso();
-
-            // Releases multishot I/O `OpWrapper` data
-            for (mio_syscall) |data| { if (data) |d| sop.heap.destroy(d); }
-
+            sop.heap.destroy(Self.mio_pull_add.?);
             debug.assert(linux.close(@intCast(sop.ring_fd)) == 0);
             if (Self.gpa) |_| debug.assert(Self.gpa.?.deinit() == .ok);
         }
@@ -181,15 +178,6 @@ pub fn AsyncIo(comptime capacity: u32) type {
 
             io_op.* = OpWrapper {.op = op, .handle = handle, .data = data };
 
-            // Keeping tabs on multishot I/O `OpWrapper` data (once)
-            switch (io_op.op.code()) {
-                .Accept => {
-                    const mio_accept = Self.mio_syscall[1];
-                    if (mio_accept == null) Self.mio_syscall[1] = io_op;
-                },
-                else => {} // NOP
-            }
-
             const entry: usize = @intFromPtr(io_op);
             _ = sop.queue.push(entry) orelse return Error.Overflow;
 
@@ -218,26 +206,16 @@ pub fn AsyncIo(comptime capacity: u32) type {
                 switch (sop.status) {
                     .inactive => unreachable,
                     .running => {
-                        if (Signal.iso().signal > 0) sop.status = .closing;
+                        if (Signal.iso().signal > 0) {
+                            if (callbacks) |cbs| { for (cbs) |cb| cb(); }
+                            Signal.Linux.signalEmit(linux.SIG.USR1);
+                            sop.status = .closing;
+                        }
                     },
                     .closing => {
-                        // Runs one last time for any remaining ops
-                        // Some memory leaks are anticipated and desired
-                        // E.g., Long timeouts, idle socket connection etc.
-
-                        if (callbacks) |cbs| { for (cbs) |cb| cb(); }
-                        // else Signal.Linux.signalEmit(linux.SIG.USR1);
-
-                        const ios = &sop.pending_kernel_ios;
-                        const result = @atomicLoad(u32, ios, .acquire);
-                        std.debug.print("Pending IO's {d}\n", .{result});
-                        if (result == 1) {
+                        if (@atomicLoad(u32, &sop.ongoing_ios, .acquire) == 1) {
                             sop.status = .closed;
                         }
-
-                        // perhaps a 1sec sleep can gather all pending I/Os
-                        std.time.sleep(std.time.ns_per_s);
-
                     },
                     .closed => break
                 }
@@ -255,8 +233,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
 
             io_op.* = OpWrapper {.op = op_data, .handle = null, .data = null };
 
-            Self.mio_syscall[0] = io_op;
-
+            Self.mio_pull_add = io_op;
             const entry: usize = @intFromPtr(io_op);
             _ = sop.queue.push(entry) orelse return Error.Overflow;
         }
@@ -292,7 +269,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
 
                 const sop = Self.iso();
                 if (!mio) {
-                    _ = @atomicRmw(u32, &sop.pending_kernel_ios, .Sub, 1, .release);
+                    _ = @atomicRmw(u32, &sop.ongoing_ios, .Sub, 1, .release);
                 }
 
                 switch (cqe.user_data) {
@@ -419,7 +396,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
             const rv = uringEnter(sop.ring_fd, batch_len, 0, submit_flags);
             if (rv < 0) @panic("Failed to push on SQE!");
 
-            _ = @atomicRmw(u32, &sop.pending_kernel_ios, .Add, batch_len, .release);
+            _ = @atomicRmw(u32, &sop.ongoing_ios, .Add, batch_len, .release);
         }
 
         /// # Extracts Completed CQE from CQ Ring Buffer
