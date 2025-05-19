@@ -197,7 +197,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
         }
 
         /// # Starts the I/O Event Loop for Execution
-        pub fn eventLoop(callbacks: ?[]ExitCallback) !void {
+        /// - `callbacks` - Runs on exit, before closing the event loop.
+        pub fn eventLoop(comptime l: u8, callbacks: ?[l]ExitCallback) !void {
             const sop = Self.iso();
 
             log.info(

@@ -23,10 +23,10 @@ pub fn main() !void {
     defer AsyncIo.deinit();
 
     try AsyncIo.timeout(res, null, .{
-        .ts = linux.timespec {.sec = 5, .nsec = 0}
+        .ts = linux.timespec {.sec = 3, .nsec = 0}
     });
 
-    try AsyncIo.eventLoop(null);
+    try AsyncIo.eventLoop(0, null);
 
     Signal.terminate(Executor);
 }
