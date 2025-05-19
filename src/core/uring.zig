@@ -225,9 +225,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         // E.g., Long timeouts, idle socket connection etc.
 
                         if (callbacks) |cbs| { for (cbs) |cb| cb(); }
-
-                        Signal.Linux.signalEmit(linux.SIG.USR1);
-                        try Self.flush();
+                        else Signal.Linux.signalEmit(linux.SIG.USR1);
                         sop.status = .closed;
 
                         // perhaps a 1sec sleep can gather all pending I/Os
@@ -254,9 +252,6 @@ pub fn AsyncIo(comptime capacity: u32) type {
 
             const entry: usize = @intFromPtr(io_op);
             _ = sop.queue.push(entry) orelse return Error.Overflow;
-
-            // Notifies the watcher
-            Signal.Linux.signalEmit(linux.SIG.USR1);
         }
 
         /// # Flushes Pending I/O Operations to the SQE
