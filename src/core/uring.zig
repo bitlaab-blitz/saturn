@@ -225,9 +225,9 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         // E.g., Long timeouts, idle socket connection etc.
 
                         if (callbacks) |cbs| { for (cbs) |cb| cb(); }
-                        try Self.flush();
 
                         Signal.Linux.signalEmit(linux.SIG.USR1);
+                        try Self.flush();
                         sop.status = .closed;
 
                         // perhaps a 1sec sleep can gather all pending I/Os
