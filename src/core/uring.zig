@@ -181,7 +181,10 @@ pub fn AsyncIo(comptime capacity: u32) type {
 
             // Keeping tabs on multishot I/O `OpWrapper` data (once)
             switch (io_op.op.code()) {
-                .Accept => Self.mio_syscall[1] = io_op,
+                .Accept => {
+                    const mio_accept = Self.mio_syscall[1];
+                    if (mio_accept == null) Self.mio_syscall[1] = io_op;
+                },
                 else => {} // NOP
             }
 
@@ -215,6 +218,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
                     },
                     .closing => {
                         // Runs one last time for any remaining ops
+                        // Some memory leaks are anticipated and desired
+                        // E.g., Long timeouts, idle socket connection etc.
                         Signal.Linux.signalEmit(linux.SIG.USR1);
                         sop.status = .closed;
                     },
@@ -298,10 +303,9 @@ pub fn AsyncIo(comptime capacity: u32) type {
 
         fn submitToSqe(entry: usize) !void {
             const io: *OpWrapper = @ptrFromInt(entry);
-
-            var prep = Self.prepSqe();
             const op_ptr = @as(?*anyopaque, io);
 
+            var prep = Self.prepSqe();
             switch(OpData.code(&io.op)) {
                 .PollAdd => {
                     const d: PollAdd = io.op.poll_add;

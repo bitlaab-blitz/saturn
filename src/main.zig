@@ -22,7 +22,6 @@ pub fn main() !void {
     try AsyncIo.init(true);
     defer AsyncIo.deinit();
 
-
     try AsyncIo.timeout(res, null, .{
         .ts = linux.timespec {.sec = 5, .nsec = 0}
     });
