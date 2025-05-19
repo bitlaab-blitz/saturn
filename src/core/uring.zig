@@ -213,6 +213,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         }
                     },
                     .closing => {
+                        Signal.Linux.signalEmit(linux.SIG.USR1);
                         if (@atomicLoad(u32, &sop.ongoing_ios, .acquire) == 1) {
                             sop.status = .closed;
                         }
