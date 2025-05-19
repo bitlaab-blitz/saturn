@@ -416,7 +416,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
             const rv = uringEnter(sop.ring_fd, batch_len, 0, submit_flags);
             if (rv < 0) @panic("Failed to push on SQE!");
 
-            _ = @atomicRmw(u32, &sop.pending_kernel_ios, .Add, 1, .release);
+            _ = @atomicRmw(u32, &sop.pending_kernel_ios, .Add, batch_len, .release);
         }
 
         /// # Extracts Completed CQE from CQ Ring Buffer
