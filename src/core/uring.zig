@@ -231,7 +231,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         const ios = &sop.pending_kernel_ios;
                         const result = @atomicLoad(u32, ios, .acquire);
                         std.debug.print("Pending IO's {d}\n", .{result});
-                        if (result == Self.mio_syscall.len) {
+                        if (result == 1) {
                             sop.status = .closed;
                         }
 
