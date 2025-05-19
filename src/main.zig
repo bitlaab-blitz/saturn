@@ -26,7 +26,7 @@ pub fn main() !void {
         .ts = linux.timespec {.sec = 5, .nsec = 0}
     });
 
-    try AsyncIo.eventLoop();
+    try AsyncIo.eventLoop(null);
 
     Signal.terminate(Executor);
 }

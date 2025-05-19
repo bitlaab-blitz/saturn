@@ -45,6 +45,7 @@ const Mode = enum(u8) {
 };
 
 const Any = ?*anyopaque;
+const ExitCallback = *const fn() void;
 
 //##############################################################################
 //# HIGH LEVEL ASYNCHRONOUS I/O INTERFACE -------------------------------------#
@@ -196,7 +197,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
         }
 
         /// # Starts the I/O Event Loop for Execution
-        pub fn eventLoop() !void {
+        pub fn eventLoop(callbacks: ?[]ExitCallback) !void {
             const sop = Self.iso();
 
             log.info(
@@ -220,8 +221,15 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         // Runs one last time for any remaining ops
                         // Some memory leaks are anticipated and desired
                         // E.g., Long timeouts, idle socket connection etc.
+
+                        if (callbacks) |cbs| { for (cbs) |cb| cb(); }
+
                         Signal.Linux.signalEmit(linux.SIG.USR1);
                         sop.status = .closed;
+
+                        // perhaps a 1sec sleep can gather all pending I/Os
+
+
                     },
                     .closed => break
                 }
