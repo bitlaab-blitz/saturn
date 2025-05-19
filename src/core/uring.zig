@@ -227,7 +227,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         if (callbacks) |cbs| { for (cbs) |cb| cb(); }
 
                         Signal.Linux.signalEmit(linux.SIG.USR1);
-                        sop.status = .closed;
+                        // sop.status = .closed;
 
                         // perhaps a 1sec sleep can gather all pending I/Os
                         std.time.sleep(std.time.ns_per_s);
