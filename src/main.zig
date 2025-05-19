@@ -29,8 +29,7 @@ pub fn main() !void {
 
     try AsyncIo.eventLoop();
 
-    Executor.iso().condition.broadcast();
-    Signal.terminate(@as(i64, Executor.iso().worker));
+    Signal.terminate(Executor);
 }
 
 fn res(cqe_res: i32, userdata: ?*anyopaque) void {

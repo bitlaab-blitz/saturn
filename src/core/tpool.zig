@@ -212,7 +212,7 @@ test "SmokeTest" {
     p_counter.condition.wait(&p_counter.mutex);
     p_counter.mutex.unlock();
 
-    Signal.terminate(8);
+    Signal.terminate(TaskExecutor);
 
     const result = @atomicLoad(usize, &p_counter.value, .acquire);
     try testing.expect(result == test_limit);

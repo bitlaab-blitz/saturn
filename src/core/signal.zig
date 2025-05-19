@@ -42,16 +42,14 @@ pub fn register(sig: i32) callconv(.C) void {
 }
 
 /// # Graceful App Shutdown
-/// - `res` - Should always be equal to the participants of the signal
-/// - `WARNING` - Incorrect participant response will create an infinite loop!
-pub fn terminate(cond: *std.Thread.Condition, res: i64) void {
-    cond.broadcast();
+/// - `T` - A singleton task executor with workers and conditional broadcast.
+pub fn terminate(T: type) void {
     const sop = Self.iso();
-    std.debug.print("Captured signal {d}\n", .{sop.signal});
+    T.iso().condition.broadcast();
 
     if (sop.signal > 0) {
         while(true) {
-            if (sop.participant == res) {
+            if (sop.participant == @as(i32, T.iso().worker)) {
                 log.info("Gracefully Shutdown.", .{});
                 break;
             }
