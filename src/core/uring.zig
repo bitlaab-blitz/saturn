@@ -79,8 +79,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
         };
 
         var so: ?SingletonObject = null;
-        var mio_syscall: [1]*OpWrapper = undefined;
         var gpa: ?std.heap.DebugAllocator(.{}) = null;
+        var mio_syscall: [2]?*OpWrapper = [_]?*OpWrapper { null } ** 2;
 
         const Self = @This();
 
@@ -104,7 +104,10 @@ pub fn AsyncIo(comptime capacity: u32) type {
         /// # Destroys Asynchronous I/O Instance
         pub fn deinit() void {
             const sop = Self.iso();
-            sop.heap.destroy(Self.mio_syscall[0]);
+
+            // Releases multishot I/O `OpWrapper` data
+            for (mio_syscall) |data| { if (data) |d| sop.heap.destroy(d); }
+
             debug.assert(linux.close(@intCast(sop.ring_fd)) == 0);
             if (Self.gpa) |_| debug.assert(Self.gpa.?.deinit() == .ok);
         }
@@ -175,6 +178,12 @@ pub fn AsyncIo(comptime capacity: u32) type {
             errdefer sop.heap.destroy(io_op);
 
             io_op.* = OpWrapper {.op = op, .handle = handle, .data = data };
+
+            // Keeping tabs on multishot I/O `OpWrapper` data (once)
+            switch (io_op.op.code()) {
+                .Accept => Self.mio_syscall[1] = io_op,
+                else => {} // NOP
+            }
 
             const entry: usize = @intFromPtr(io_op);
             _ = sop.queue.push(entry) orelse return Error.Overflow;
