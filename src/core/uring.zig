@@ -76,7 +76,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
             sfd: i32,
             status: EventLoopStatus,
             heap: mem.Allocator,
-            queue: MPSC(capacity)
+            queue: MPSC(capacity),
+            pending_kernel_ios: u32 = 0
         };
 
         var so: ?SingletonObject = null;
@@ -211,6 +212,9 @@ pub fn AsyncIo(comptime capacity: u32) type {
             sop.status = .running;
 
             while(true) {
+                const result = @atomicLoad(u32, &sop.pending_kernel_ios, .acquire);
+                std.debug.print("Pending IO's {d}\n", .{result});
+
                 try Self.flush();    // Submitted I/O
                 try Self.reapCqes(); // Completed I/O
 
@@ -284,6 +288,10 @@ pub fn AsyncIo(comptime capacity: u32) type {
                 const mio = if (cqe_flags == CQE_F_MORE) true else false;
 
                 const sop = Self.iso();
+                if (!mio) {
+                    _ = @atomicRmw(u32, &sop.pending_kernel_ios, .Sub, 1, .release);
+                }
+
                 switch (cqe.user_data) {
                     0 => if (cqe.res < 0) utils.syscallError(cqe.res, @src()),
                     1 => {
@@ -407,6 +415,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
 
             const rv = uringEnter(sop.ring_fd, batch_len, 0, submit_flags);
             if (rv < 0) @panic("Failed to push on SQE!");
+
+            _ = @atomicRmw(u32, &sop.pending_kernel_ios, .Add, 1, .release);
         }
 
         /// # Extracts Completed CQE from CQ Ring Buffer
