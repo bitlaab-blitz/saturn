@@ -212,9 +212,6 @@ pub fn AsyncIo(comptime capacity: u32) type {
             sop.status = .running;
 
             while(true) {
-                const result = @atomicLoad(u32, &sop.pending_kernel_ios, .acquire);
-                std.debug.print("Pending IO's {d}\n", .{result});
-
                 try Self.flush();    // Submitted I/O
                 try Self.reapCqes(); // Completed I/O
 
@@ -229,8 +226,14 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         // E.g., Long timeouts, idle socket connection etc.
 
                         if (callbacks) |cbs| { for (cbs) |cb| cb(); }
-                        else Signal.Linux.signalEmit(linux.SIG.USR1);
-                        sop.status = .closed;
+                        // else Signal.Linux.signalEmit(linux.SIG.USR1);
+
+                        const ios = &sop.pending_kernel_ios;
+                        const result = @atomicLoad(u32, ios, .acquire);
+                        std.debug.print("Pending IO's {d}\n", .{result});
+                        if (result == Self.mio_syscall.len) {
+                            sop.status = .closed;
+                        }
 
                         // perhaps a 1sec sleep can gather all pending I/Os
                         std.time.sleep(std.time.ns_per_s);
