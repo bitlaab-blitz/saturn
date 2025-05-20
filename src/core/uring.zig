@@ -252,7 +252,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
             }
 
             if (count > 0) { Self.pushSqes(count); return; }
-            if (sop.status == .closing) return;
+            if (sop.status == .draining) return;
 
             // EINTR: -4 (Interrupted system call)
             const rv = uringEnter(sop.ring_fd, 0, 1, ENTER_GETEVENTS);
