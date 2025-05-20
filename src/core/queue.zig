@@ -1,5 +1,4 @@
-//! # Multi-Threaded Queue Module
-//! **Last Updated: 05 May 2025 - v1.0.0**
+//! # Multi-Threaded Queue Module - v1.0.0
 //! - Lock-free and wait-free multi-producer and/or multi-consumer queues
 //! - Provides thread synchronization for highly multi-threaded workloads
 //!
@@ -21,7 +20,6 @@
 //! it would violate the atomicity and correctness guarantees of CAS operation!
 
 const std = @import("std");
-const mem = std.mem;
 const math = std.math;
 const debug = std.debug;
 
@@ -41,6 +39,8 @@ pub fn SPMC(comptime entries: u32) type {
         const depth = entries;
         const mask = entries - 1;
 
+        const ORD = .monotonic;
+
         const Self = @This();
 
         pub fn init() Self { return .{}; }
@@ -50,12 +50,13 @@ pub fn SPMC(comptime entries: u32) type {
         /// # Returns the Queued Position of the Entry
         pub fn push(self: *Self, entry: usize) ?usize {
             for (0..Self.depth) |_| {
-                defer self.head +%= 1; // Next try or push
                 const index = self.head & Self.mask;
                 if (self.ring[index] == 0) {
                     self.ring[index] = entry;
                     return index;
                 }
+
+                self.head +%= 1; // Next try or push
             }
 
             return null; // Queue is full
@@ -66,14 +67,18 @@ pub fn SPMC(comptime entries: u32) type {
             var max_retry = Self.depth;
 
             while (max_retry > 0) : (max_retry -= 1) {
-                defer self.tail +%= 1; // Next try or pop
                 const index = self.tail & Self.mask;
+                const ptr = &self.ring[index];
 
-                if (@cmpxchgWeak(usize, &self.ring[index], 0, 0, .monotonic, .monotonic)) |entry| {
+                if (@cmpxchgWeak(usize, ptr, 0, 0, ORD, ORD)) |entry| {
                     if (entry == 0) continue;
                     // Ensures `entry` isn't popped by other since last check ↖
-                    if (@cmpxchgWeak(usize, &self.ring[index], entry, 0, .monotonic, .monotonic) == null) return .{.index = index, .entry = entry};
+                    if (@cmpxchgWeak(usize, ptr, entry, 0, ORD, ORD) == null) {
+                        return .{.index = index, .entry = entry};
+                    }
                 }
+
+                self.tail +%= 1; // Next try or pop
             }
 
             return null; // Queue is empty
@@ -94,6 +99,8 @@ pub fn MPSC(comptime entries: u32) type {
         const depth = entries;
         const mask = entries - 1;
 
+        const ORD = .monotonic;
+
         const Self = @This();
 
         pub fn init() Self { return .{}; }
@@ -103,8 +110,12 @@ pub fn MPSC(comptime entries: u32) type {
         /// # Returns the Queued Position of the Entry
         pub fn push(self: *Self, entry: usize) ?usize {
             for (0..Self.depth) |_| {
-                defer self.head +%= 1; // Next try or push
-                if (@cmpxchgWeak(usize, &self.ring[self.head & Self.mask], 0, entry, .monotonic, .monotonic) == null) return self.head & Self.mask;
+                const ptr = &self.ring[self.head & Self.mask];
+                if (@cmpxchgWeak(usize, ptr, 0, entry, ORD, ORD) == null) {
+                    return self.head & Self.mask;
+                }
+
+                self.head +%= 1; // Next try or push
             }
 
             return null; // Queue is full
@@ -115,7 +126,6 @@ pub fn MPSC(comptime entries: u32) type {
             var max_retry = Self.depth;
 
             while (max_retry > 0) : (max_retry -= 1) {
-                defer self.tail +%= 1; // Next pop
                 const index = self.tail & Self.mask;
                 const entry = self.ring[index];
 
@@ -123,14 +133,14 @@ pub fn MPSC(comptime entries: u32) type {
                     self.ring[index] = 0;
                     return .{.index = index, .entry = entry};
                 }
+
+                self.tail +%= 1; // Next pop
             }
 
             return null; // Queue is empty
         }
     };
 }
-
-
 
 /// # Multi-Producer Multi-Consumer Queue
 /// - `entries` - Must be the power of two e.g., `512`, `1024`, etc.
@@ -145,6 +155,8 @@ pub fn MPMC(comptime entries: u32) type {
         const depth = entries;
         const mask = entries - 1;
 
+        const ORD = .monotonic;
+
         const Self = @This();
 
         pub fn init() Self { return .{}; }
@@ -154,10 +166,12 @@ pub fn MPMC(comptime entries: u32) type {
         /// # Returns the Queued Position of the Entry
         pub fn push(self: *Self, entry: usize) ?usize {
             for (0..Self.depth) |_| {
-                defer self.head +%= 1; // Next try or push
-                if (@cmpxchgWeak(usize, &self.ring[self.head & Self.mask], 0, entry, .monotonic, .monotonic) == null) {
+                const ptr = &self.ring[self.head & Self.mask];
+                if (@cmpxchgWeak(usize, ptr, 0, entry, ORD, ORD) == null) {
                     return self.head & Self.mask;
                 }
+
+                self.head +%= 1; // Next try or push
             }
 
             return null; // Queue is full
@@ -168,14 +182,18 @@ pub fn MPMC(comptime entries: u32) type {
             var max_retry = Self.depth;
 
             while (max_retry > 0) : (max_retry -= 1) {
-                defer self.tail +%= 1; // Next try or pop
                 const index = self.tail & Self.mask;
+                const ptr = &self.ring[index];
 
-                if (@cmpxchgWeak(usize, &self.ring[index], 0, 0, .monotonic, .monotonic)) |entry| {
+                if (@cmpxchgWeak(usize, ptr, 0, 0, ORD, ORD)) |entry| {
                     if (entry == 0) continue;
                     // Ensures `entry` isn't popped by other since last check ↖
-                    if (@cmpxchgWeak(usize, &self.ring[index], entry, 0, .monotonic, .monotonic) == null) return .{.index = index, .entry = entry};
+                    if (@cmpxchgWeak(usize, ptr, entry, 0, ORD, ORD) == null) {
+                        return .{.index = index, .entry = entry};
+                    }
                 }
+
+                self.tail +%= 1; // Next try or pop
             }
 
             return null; // Queue is empty

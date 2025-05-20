@@ -1,13 +1,12 @@
-//! # Thread Pool Module For CPU Bound Workloads
-//! **Last Updated: 08 May 2025 - v1.0.0**
+//! # Thread Pool Module For CPU Bound Workloads - v1.0.0
 //! - Multi-producer and multi-consumer (MPMC) ring buffer
 //! - Lock-free and wait-free task submission and completion
 //! - Thread per core (logical) architecture with `N` number of workers
 //! - Parallel task submission and execution with atomic CAS and memory ordering
 //!
-//! **Remarks:**
+//! **Remarks:** on task execution:
 //! - Sequential execution of the submitted tasks are not guaranteed
-//! - Tasks synchronization (if necessary) must be managed explicitly in the App
+//! - Tasks synchronization (if necessary) must be managed explicitly by the App
 //! - See - https://internalpointers.com/post/gentle-introduction-multithreading
 //! - See - https://youtube.com/watch?v=RWCadBJ6wTk
 //! - See - https://youtube.com/watch?v=A8eCGOqgvH4
@@ -27,7 +26,7 @@ const queue = @import("./queue.zig");
 const MPMC = queue.MPMC;
 
 
-const Error = error { Overflow, Halting };
+const Error = error { Overflow, Draining };
 
 const Args = ?*anyopaque;
 const Callback = *const fn(Args) void;
@@ -47,8 +46,8 @@ pub fn Executor(comptime capacity: u32) type {
             condition: Thread.Condition
 
             // TODO:
-            // var counter: usize align(std.atomic.cache_line) = 0;
-            // To see if applying cache line gives any performance boost
+            // e.g., var counter: usize align(std.atomic.cache_line) = 0;
+            // To see if applying cache line gives any performance boost!
         };
 
         var so: ?SingletonObject = null;
@@ -104,7 +103,7 @@ pub fn Executor(comptime capacity: u32) type {
             );
         }
 
-        /// # Consumes and executes a submitted task from the queue
+        /// # Consumes and Executes a Submitted Task from the Queue
         fn tick() void {
             var sop = Self.iso();
 
@@ -132,10 +131,10 @@ pub fn Executor(comptime capacity: u32) type {
         /// # Returns Internal Static Object
         pub fn iso() *SingletonObject { return &Self.so.?; }
 
-        /// # Task On Queue
+        /// # Submits a New Task on Queue
         pub fn submit(handle: Callback, data: Args) !void {
             var sop = Self.iso();
-            if (Signal.iso().signal > 0) return Error.Halting;
+            if (Signal.iso().signal > 0) return Error.Draining;
 
             const task = try sop.heap.create(Task);
             task.* = Task {.handle = handle, .data = data};

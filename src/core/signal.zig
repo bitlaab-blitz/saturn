@@ -1,5 +1,4 @@
 //! # App Interrupt Signal Handler Module
-//! 
 //! - Provides a set of utilities for interrupt register and participants
 //!
 //! NOTE: Only the detached threads (worker) are eligible to participate!
@@ -37,8 +36,7 @@ pub fn register(sig: i32) callconv(.C) void {
         else => @panic("Encountered an Unknown Signal")
     }
 
-    const sop = Self.iso();
-    sop.signal = sig;
+    Self.iso().signal = sig;
 }
 
 /// # Graceful App Shutdown
@@ -76,7 +74,7 @@ pub const Linux = struct {
         debug.assert(linux.sigaction(sig, &sig_ign, null) == 0);
     }
 
-    /// # Masks Given Sigset
+    /// # Masks the Given Sigset
     /// **Remarks:** Prevents default signal disposition for the given sigset
     pub fn signalMask(sigs: []u6) linux.sigset_t {
         var sigset: linux.sigset_t = linux.empty_sigset;

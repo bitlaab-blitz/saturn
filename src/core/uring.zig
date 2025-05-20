@@ -31,7 +31,7 @@ const MPSC = queue.MPSC;
 
 const Error = error { Overflow, Closed };
 
-const EventLoopStatus = enum { inactive, running, closing, closed };
+const EventLoopStatus = enum { inactive, running, draining, closed };
 
 /// # I/O SQE Operation Modes
 /// - See section [5.1] and [5.2] on - https://kernel.dk/io_uring.pdf
@@ -111,7 +111,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
             if (Self.gpa) |_| debug.assert(Self.gpa.?.deinit() == .ok);
         }
 
-        /// # Internal Static Object
+        /// # Returns Internal Static Object
         pub fn iso() *SingletonObject { return &Self.so.?; }
 
         /// # Sleeps for a Specified Duration
@@ -129,7 +129,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
             try submit(OpData {.shutdown = op}, callback, data);
         }
 
-        /// # Open and Possibly Create a File
+        /// # Open and Possibly Creates a File
         pub fn open(callback: ?OpHandler, data: Any, op: Open) !void {
             try submit(OpData {.open = op}, callback, data);
         }
@@ -176,7 +176,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
             const io_op = try sop.heap.create(OpWrapper);
             errdefer sop.heap.destroy(io_op);
 
-            io_op.* = OpWrapper {.op = op, .handle = handle, .data = data };
+            io_op.* = OpWrapper {.op = op, .handle = handle, .data = data};
 
             const entry: usize = @intFromPtr(io_op);
             _ = sop.queue.push(entry) orelse return Error.Overflow;
@@ -187,7 +187,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
 
         /// # Starts the I/O Event Loop for Execution
         /// - `l` - Length of the callbacks array at compile time
-        /// - `callbacks` - Runs on exit, before closing the event loop
+        /// - `callbacks` - Runs on exit, **null** when `l` is set to **0**
         pub fn eventLoop(comptime l: u8, callbacks: ?[l]ExitCallback) !void {
             const sop = Self.iso();
 
@@ -200,8 +200,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
             sop.status = .running;
 
             while(true) {
-                try Self.flush();    // Submitted I/O
-                try Self.reapCqes(); // Completed I/O
+                try Self.flush();    // For I/O submission
+                try Self.reapCqes(); // For I/O completion
 
                 switch (sop.status) {
                     .inactive => unreachable,
@@ -209,10 +209,10 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         if (Signal.iso().signal > 0) {
                             if (callbacks) |cbs| { for (cbs) |cb| cb(); }
                             Signal.Linux.signalEmit(linux.SIG.USR1);
-                            sop.status = .closing;
+                            sop.status = .draining;
                         }
                     },
-                    .closing => {
+                    .draining => {
                         Signal.Linux.signalEmit(linux.SIG.USR1);
                         if (@atomicLoad(u32, &sop.ongoing_ios, .acquire) == 1) {
                             sop.status = .closed;
@@ -223,7 +223,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
             }
         }
 
-        /// # Watches for any I/O Submission
+        /// # Initiates Multishot I/O Submission Watcher
         fn watch() !void {
             const sop = Self.iso();
             const data = PollAdd {.fd = sop.sfd, .mask = linux.POLL.IN};
@@ -232,7 +232,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
             const io_op = try sop.heap.create(OpWrapper);
             errdefer sop.heap.destroy(io_op);
 
-            io_op.* = OpWrapper {.op = op_data, .handle = null, .data = null };
+            io_op.* = OpWrapper {.op = op_data, .handle = null, .data = null};
 
             Self.mio_pull_add = io_op;
             const entry: usize = @intFromPtr(io_op);
@@ -240,9 +240,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
         }
 
         /// # Flushes Pending I/O Operations to the SQE
-        /// - Submits consumed op to the SQE for completion
-        /// - Sleeps when waiting on CQE completions or idle
-        /// - Wakes up when `submit()` is called for a new op
+        /// **Remarks:** When the queue is empty, it blocks the event loop
+        /// until an I/O completes or a new task is submitted via `submit()`.
         fn flush() !void {
             var count: u32 = 0;
             const sop = Self.iso();
@@ -269,14 +268,13 @@ pub fn AsyncIo(comptime capacity: u32) type {
                 const mio = if (cqe_flags == CQE_F_MORE) true else false;
 
                 const sop = Self.iso();
-                if (!mio) {
-                    _ = @atomicRmw(u32, &sop.ongoing_ios, .Sub, 1, .release);
-                }
+                const ptr = &sop.ongoing_ios;
+                if (!mio) _ = @atomicRmw(u32, ptr, .Sub, 1, .release);
 
                 switch (cqe.user_data) {
                     0 => if (cqe.res < 0) utils.syscallError(cqe.res, @src()),
                     1 => {
-                        // PollAdd signal handler - Consume the emitted signal
+                        // PollAdd signal handler - Consumes the emitted signal
                         var info = mem.zeroes(SigInfo);
                         _ = linux.read(3, mem.asBytes(&info), @sizeOf(SigInfo));
                     },
@@ -296,6 +294,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
             }
         }
 
+        /// # Submits an I/O to SQE
         fn submitToSqe(entry: usize) !void {
             const io: *OpWrapper = @ptrFromInt(entry);
             const op_ptr = @as(?*anyopaque, io);
