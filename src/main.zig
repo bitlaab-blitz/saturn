@@ -6,6 +6,9 @@ const Signal = saturn.Signal;
 const AsyncIo = saturn.AsyncIo(512);
 const Executor = saturn.TaskExecutor(512);
 
+// To kill rouge one or more rouge processes run:
+// sudo kill -9 "$(pidof saturn | awk '{print $1}')"
+
 
 pub fn main() !void {
     var gpa_mem = std.heap.DebugAllocator(.{}).init;
@@ -22,16 +25,9 @@ pub fn main() !void {
     try AsyncIo.init(true);
     defer AsyncIo.deinit();
 
-    try AsyncIo.timeout(res, null, .{
-        .ts = linux.timespec {.sec = 3, .nsec = 0}
-    });
+    // Write your code here...
 
     try AsyncIo.eventLoop(0, null);
 
     Signal.terminate(Executor);
-}
-
-fn res(cqe_res: i32, userdata: ?*anyopaque) void {
-    _ = userdata;
-    std.debug.print("res: {}\n", .{cqe_res});
 }

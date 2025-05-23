@@ -115,60 +115,74 @@ pub fn AsyncIo(comptime capacity: u32) type {
         pub fn iso() *SingletonObject { return &Self.so.?; }
 
         /// # Sleeps for a Specified Duration
-        pub fn timeout(callback: ?OpHandler, data: Any, op: Timeout) !void {
-            try submit(OpData {.timeout = op}, callback, data);
+        /// **Remarks:** When `interval` is set to **0**, timeout runs forever.
+        pub fn timeout(callback: ?OpHandler, data: Any, op: Timeout) !u64 {
+            return try submit(OpData {.timeout = op}, callback, data);
+        }
+
+        /// # Removes a Running Timeout Operation
+        /// **Remarks:** When `ts` isn't **null**, updates the timer instead.
+        /// For multishot timeouts, the update only affects the current timer
+        /// and overrides any previously set `interval` limit to **0**.
+        pub fn timeopt(callback: ?OpHandler, data: Any, op: Timeopt) !void {
+            _ = try submit(OpData {.timeopt = op}, callback, data);
+        }
+
+        /// # Cancels an Already Issued Request
+        pub fn cancel(callback: ?OpHandler, data: Any, op: Cancel) !void {
+            _ = try submit(OpData {.cancel = op}, callback, data);
         }
 
         /// # Accepts New Connection on a Socket
         pub fn accept(callback: ?OpHandler, data: Any, op: Accept) !void {
-            try submit(OpData {.accept = op}, callback, data);
+            _ = try submit(OpData {.accept = op}, callback, data);
         }
 
         /// # Shuts Down a Socket Connection
         pub fn shutdown(callback: ?OpHandler, data: Any, op: Shutdown) !void {
-            try submit(OpData {.shutdown = op}, callback, data);
+            _ = try submit(OpData {.shutdown = op}, callback, data);
         }
 
         /// # Open and Possibly Creates a File
         pub fn open(callback: ?OpHandler, data: Any, op: Open) !void {
-            try submit(OpData {.open = op}, callback, data);
+            _ = try submit(OpData {.open = op}, callback, data);
         }
 
         /// # Closes a File Descriptor
         pub fn close(callback: ?OpHandler, data: Any, op: Close) !void {
-            try submit(OpData {.close = op}, callback, data);
+            _ = try submit(OpData {.close = op}, callback, data);
         }
 
         /// # Sends a Message on a Socket
         pub fn send(callback: ?OpHandler, data: Any, op: Send) !void {
-            try submit(OpData {.send = op}, callback, data);
+            _ = try submit(OpData {.send = op}, callback, data);
         }
 
         /// # Receives a Message from a Socket
         pub fn recv(callback: ?OpHandler, data: Any, op: Recv) !void {
-            try submit(OpData {.recv = op}, callback, data);
+            _ = try submit(OpData {.recv = op}, callback, data);
         }
 
         /// # Reads from a File Descriptor at a Given Offset
         pub fn read(callback: ?OpHandler, data: Any, op: Read) !void {
-            try submit(OpData {.read = op}, callback, data);
+            _ = try submit(OpData {.read = op}, callback, data);
         }
 
         /// # Writes to a File Descriptor at a Given Offset
         pub fn write(callback: ?OpHandler, data: Any, op: Write) !void {
-            try submit(OpData {.write = op}, callback, data);
+            _ = try submit(OpData {.write = op}, callback, data);
         }
 
         /// # Gets Extended File Status
         pub fn status(callback: ?OpHandler, data: Any, op: Status) !void {
-            try submit(OpData {.status = op}, callback, data);
+            _ = try submit(OpData {.status = op}, callback, data);
         }
 
         /// # Returns the Current Event Loop Status
         pub fn evlStatus() EventLoopStatus { return Self.iso().status; }
 
         /// # Submits a New I/O Operation
-        fn submit(op: OpData, handle: ?OpHandler, data: ?*anyopaque) !void {
+        fn submit(op: OpData, handle: ?OpHandler, data: ?*anyopaque) !u64 {
             const sop = Self.iso();
 
             if (sop.status == .closed) return Error.Closed;
@@ -183,6 +197,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
 
             // Notifies the watcher
             Signal.Linux.signalEmit(linux.SIG.USR1);
+
+            return @intCast(@intFromPtr(io_op));
         }
 
         /// # Starts the I/O Event Loop for Execution
@@ -213,6 +229,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         }
                     },
                     .draining => {
+                        std.Thread.sleep(std.time.ns_per_s / 4);
                         Signal.Linux.signalEmit(linux.SIG.USR1);
                         if (@atomicLoad(u32, &sop.ongoing_ios, .acquire) == 1) {
                             sop.status = .closed;
@@ -306,8 +323,25 @@ pub fn AsyncIo(comptime capacity: u32) type {
                     Syscall.pollAdd(&prep, d.fd, d.mask, d.mode);
                 },
                 .Timeout => {
-                    var d: Timeout = io.op.timeout;
-                    Syscall.timeout(&prep, op_ptr, &d.ts, d.mode);
+                    const d: *Timeout = &io.op.timeout;
+                    Syscall.timeout(&prep, op_ptr, &d.ts, d.interval, d.mode);
+                },
+                .Timeopt => {
+                    const d: Timeopt = io.op.timeopt;
+                    const target: *OpWrapper = @ptrFromInt(d.timeout_data);
+                    const p = blk: {
+                        if (d.ts) |ts| {
+                            const ts_prt = &target.op.timeout.ts;
+                            ts_prt.* = ts; // Swaps the timespec
+                            break :blk ts_prt;
+                        } else break :blk null;
+                    };
+
+                    Syscall.timeopt(&prep, op_ptr, p, d.timeout_data, d.mode);
+                },
+                .Cancel => {
+                    const d: Cancel = io.op.cancel;
+                    Syscall.cancel(&prep, op_ptr, d.userdata, d.mode);
                 },
                 .Accept => {
                     const d: Accept = io.op.accept;
@@ -329,7 +363,6 @@ pub fn AsyncIo(comptime capacity: u32) type {
                     const d: Close = io.op.close;
                     Syscall.close(&prep, op_ptr, d.fd, d.mode);
                 },
-
                 .Send => {
                     const d: Send = io.op.send;
                     Syscall.send(&prep, op_ptr, d.fd, d.buff, d.len, d.mode);
@@ -424,6 +457,18 @@ const PollAdd = struct {
 
 const Timeout = struct {
     ts: linux.timespec,
+    interval: ?u64 = null,
+    mode: Mode = .io_async
+};
+
+const Timeopt = struct {
+    ts: ?linux.timespec = null,
+    timeout_data: u64,
+    mode: Mode = .io_async
+};
+
+const Cancel = struct {
+    userdata: u64,
     mode: Mode = .io_async
 };
 
@@ -499,6 +544,8 @@ const OpData = union(enum) {
     const Op = enum {
         PollAdd,
         Timeout,
+        Timeopt,
+        Cancel,
         Accept,
         Shutdown,
         Open,
@@ -512,6 +559,8 @@ const OpData = union(enum) {
 
     poll_add: PollAdd,
     timeout:  Timeout,
+    timeopt:  Timeopt,
+    cancel:   Cancel,
     accept:   Accept,
     shutdown: Shutdown,
     open:     Open,
@@ -526,6 +575,8 @@ const OpData = union(enum) {
         return switch (self.*) {
             .poll_add => .PollAdd,
             .timeout =>  .Timeout,
+            .timeopt =>  .Timeopt,
+            .cancel =>   .Cancel,
             .accept =>   .Accept,
             .shutdown => .Shutdown,
             .open =>     .Open,
@@ -570,16 +621,58 @@ const Syscall = struct {
         pd: *PrepData,
         p: ?*anyopaque,
         ts: *linux.timespec,
+        ic: ?u64, // interval count
         io_mode: Mode
     ) void {
         pd.sqe.opcode = linux.IORING_OP.TIMEOUT;
         pd.sqe.fd = 0;
         pd.sqe.flags = @intFromEnum(io_mode);
         pd.sqe.ioprio = 0;
-        pd.sqe.union_1.off = 0;
+        pd.sqe.union_1.off = ic orelse 0;
         pd.sqe.union_2.addr = @intFromPtr(ts);
         pd.sqe.len = 1;
-        pd.sqe.union_3.timeout_flags = linux.IORING_TIMEOUT_BOOTTIME;
+        pd.sqe.union_3.timeout_flags = if (ic != null) TIMEOUT_MULTISHOT else 0;
+        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
+        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
+    }
+
+    /// # Issues the io_uring `timeout_remove` Operation
+    /// - See `IORING_OP_TIMEOUT_REMOVE` section on `io_uring_enter(2)` man page
+    fn timeopt(
+        pd: *PrepData,
+        p: ?*anyopaque,
+        ts: ?*linux.timespec,
+        timeout_data: u64,
+        io_mode: Mode
+    ) void {
+        pd.sqe.opcode = linux.IORING_OP.TIMEOUT_REMOVE;
+        pd.sqe.fd = 0;
+        pd.sqe.flags = @intFromEnum(io_mode);
+        pd.sqe.ioprio = 0;
+        pd.sqe.union_1.addr2 = @intFromPtr(ts);
+        pd.sqe.union_2.addr = timeout_data;
+        pd.sqe.len = 0;
+        pd.sqe.union_3.timeout_flags = if (ts != null) TIMEOUT_UPDATE else 0;
+        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
+        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
+    }
+
+    /// # Issues the io_uring `async_cancel` Operation
+    /// - See `IORING_OP_ASYNC_CANCEL` section on `io_uring_enter(2)` man page
+    fn cancel(
+        pd: *PrepData,
+        p: ?*anyopaque,
+        userdata: u64,
+        io_mode: Mode
+    ) void {
+        pd.sqe.opcode = linux.IORING_OP.ASYNC_CANCEL;
+        pd.sqe.fd = 0;
+        pd.sqe.flags = @intFromEnum(io_mode);
+        pd.sqe.ioprio = 0;
+        pd.sqe.union_1.off = 0;
+        pd.sqe.union_2.addr = userdata;
+        pd.sqe.len = 0;
+        pd.sqe.union_3.rw_flags = 0;
         pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
         pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
@@ -803,17 +896,23 @@ const SETUP_SQPOLL = linux.IORING_SETUP_SQPOLL;
 const SETUP_ATTACH_WQ = linux.IORING_SETUP_ATTACH_WQ;
 const SETUP_SINGLE_ISSUER = linux.IORING_SETUP_SINGLE_ISSUER;
 
-// IO Uring Context SQE flags
+// IO Uring Context SQE Flags
 const ENTER_SQ_WAIT = linux.IORING_ENTER_SQ_WAIT;
 const SQ_NEED_WAKEUP = linux.IORING_SQ_NEED_WAKEUP;
 const ENTER_SQ_WAKEUP = linux.IORING_ENTER_SQ_WAKEUP;
 
-// IO Uring Context POLL flags
+// IO Uring Context POLL Flags
 const POLL_ADD_MULTI = linux.IORING_POLL_ADD_MULTI;
+
+// IO Uring Multishot Flags
 const ACCEPT_MULTISHOT = linux.IORING_ACCEPT_MULTISHOT;
 const RECVSEND_POLL_FIRST = linux.IORING_RECVSEND_POLL_FIRST;
+const TIMEOUT_MULTISHOT = 1 << 6; // Not added yet in Zig's Std
 
-// IO Uring Context CQE flags
+// IO Uring Timeout Flags
+const TIMEOUT_UPDATE = 1 << 1; // Not added yet in Zig's Std
+
+// IO Uring Context CQE Flags
 const CQE_F_MORE = linux.IORING_CQE_F_MORE;
 const ENTER_GETEVENTS = linux.IORING_ENTER_GETEVENTS;
 
