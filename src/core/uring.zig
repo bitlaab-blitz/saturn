@@ -39,9 +39,16 @@ const Mode = enum(u8) {
     /// Waits for previous SQEs to be complete (A ← B ← C)
     io_drain = linux.IOSQE_IO_DRAIN,
     /// Chains subsequent SQEs together (A → B → C)
-    io_link = linux.IOSQE_IO_LINK,
+    io_link  = linux.IOSQE_IO_LINK,
     /// Runs SQEs independent of each other (A | B | C)
     io_async = linux.IOSQE_ASYNC
+};
+
+/// # Socket's Communication Channel
+const Channel = enum(u32) {
+    Read    = linux.SHUT.RD,
+    Write   = linux.SHUT.WR,
+    Duplex  = linux.SHUT.RDWR
 };
 
 const Any = ?*anyopaque;
@@ -351,7 +358,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
                 },
                 .Shutdown => {
                     const d: Shutdown = io.op.shutdown;
-                    Syscall.shutdown(&prep, op_ptr, d.fd, d.mode);
+                    Syscall.shutdown(&prep, op_ptr, d.fd, d.channel, d.mode);
                 },
                 .Open => {
                     const d: Open = io.op.open;
@@ -481,6 +488,7 @@ const Accept = struct {
 
 const Shutdown = struct {
     fd: i32,
+    channel: Channel,
     mode: Mode = .io_async
 };
 
@@ -706,6 +714,7 @@ const Syscall = struct {
         pd: *PrepData,
         p: ?*anyopaque,
         sock_fd: i32,
+        channel: Channel,
         io_mode: Mode
     ) void {
         pd.sqe.opcode = linux.IORING_OP.SHUTDOWN;
@@ -714,7 +723,7 @@ const Syscall = struct {
         pd.sqe.ioprio = 0;
         pd.sqe.union_1.off = 0;
         pd.sqe.union_2.addr = 0;
-        pd.sqe.len = linux.SHUT.RD;
+        pd.sqe.len =  @intFromEnum(channel);
         pd.sqe.union_3.rw_flags = 0;
         pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
         pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
