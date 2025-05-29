@@ -210,7 +210,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
 
         /// # Starts the I/O Event Loop for Execution
         /// - `l` - Length of the callbacks array at compile time
-        /// - `callbacks` - Runs on exit, **null** when `l` is set to **0**
+        /// - `callbacks` - Runs on exit, Use **null** when `l` is set to `0`
         pub fn eventLoop(comptime l: u8, callbacks: ?[l]ExitCallback) !void {
             const sop = Self.iso();
             var timestamp: i64 = undefined;
