@@ -213,6 +213,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
         /// - `callbacks` - Runs on exit, **null** when `l` is set to **0**
         pub fn eventLoop(comptime l: u8, callbacks: ?[l]ExitCallback) !void {
             const sop = Self.iso();
+            var timestamp: i64 = undefined;
 
             log.info(
                 "Async I/O event loop is running on [SQ-{d} | CQ-{d}]",
@@ -232,14 +233,17 @@ pub fn AsyncIo(comptime capacity: u32) type {
                         if (Signal.iso().signal > 0) {
                             if (callbacks) |cbs| { for (cbs) |cb| cb(); }
                             Signal.Linux.signalEmit(linux.SIG.USR1);
+                            timestamp = std.time.milliTimestamp();
                             sop.status = .draining;
                         }
                     },
                     .draining => {
-                        std.Thread.sleep(std.time.ns_per_s / 4);
                         Signal.Linux.signalEmit(linux.SIG.USR1);
-                        if (@atomicLoad(u32, &sop.ongoing_ios, .acquire) == 1) {
-                            sop.status = .closed;
+                        const io = @atomicLoad(u32, &sop.ongoing_ios, .acquire);
+                        const delta = std.time.milliTimestamp();
+                        if (delta - timestamp >= 100) {
+                            if (io > 1) timestamp = std.time.milliTimestamp()
+                            else sop.status = .closed;
                         }
                     },
                     .closed => break
