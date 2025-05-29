@@ -141,8 +141,8 @@ pub fn AsyncIo(comptime capacity: u32) type {
         }
 
         /// # Accepts New Connection on a Socket
-        pub fn accept(callback: ?OpHandler, data: Any, op: Accept) !void {
-            _ = try submit(OpData {.accept = op}, callback, data);
+        pub fn accept(callback: ?OpHandler, data: Any, op: Accept) !u64 {
+            return try submit(OpData {.accept = op}, callback, data);
         }
 
         /// # Shuts Down a Socket Connection
