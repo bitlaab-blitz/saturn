@@ -17,6 +17,7 @@ const debug = std.debug;
 const posix = std.posix;
 const Statx = linux.Statx;
 const linux = std.os.linux;
+const process = std.process;
 const SemVer = std.SemanticVersion;
 const SigInfo = linux.signalfd_siginfo;
 
@@ -115,7 +116,11 @@ pub fn AsyncIo(comptime capacity: u32) type {
             const sop = Self.iso();
             sop.heap.destroy(Self.mio_pull_add.?);
             debug.assert(linux.close(@intCast(sop.ring_fd)) == 0);
-            if (Self.gpa) |_| debug.assert(Self.gpa.?.deinit() == .ok);
+            if (Self.gpa) |_| {
+                switch (Self.gpa.?.deinit()) {
+                    .ok => process.exit(0), .leak => process.exit(1)
+                }
+            }
         }
 
         /// # Returns Internal Static Object

@@ -18,6 +18,7 @@ const log = std.log;
 const heap = std.heap;
 const time = std.time;
 const Thread = std.Thread;
+const process = std.process;
 const testing = std.testing;
 
 const Signal = @import("./signal.zig");
@@ -86,7 +87,11 @@ pub fn Executor(comptime capacity: u32) type {
         /// # Destroys the Executor
         /// **Remarks:** `NOP` when `detect_mem_leaks` is **false**.
         pub fn deinit() void {
-            if (Self.gpa) |_| std.debug.assert(Self.gpa.?.deinit() == .ok);
+            if (Self.gpa) |_| {
+                switch (Self.gpa.?.deinit()) {
+                    .ok => process.exit(0), .leak => process.exit(1)
+                }
+            }
         }
 
         /// # Spawns the Worker Threads
