@@ -67,7 +67,7 @@ pub const Linux = struct {
     pub fn signal(sig: u6, handler: *const fn (i32) callconv(.c) void) void {
         const sig_ign = linux.Sigaction {
             .handler = .{.handler = handler},
-            .mask = linux.empty_sigset,
+            .mask = linux.sigemptyset(),
             .flags = 0,
         };
 
@@ -77,7 +77,7 @@ pub const Linux = struct {
     /// # Masks the Given Sigset
     /// **Remarks:** Prevents default signal disposition for the given sigset
     pub fn signalMask(sigs: []u6) linux.sigset_t {
-        var sigset: linux.sigset_t = linux.empty_sigset;
+        var sigset: linux.sigset_t = linux.sigemptyset();
         for (sigs) |sig| linux.sigaddset(&sigset, sig);
 
         if (linux.sigprocmask(linux.SIG.BLOCK, &sigset, null) != 0) {
