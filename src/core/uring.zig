@@ -1084,9 +1084,9 @@ const Uring = struct {
         _ = linux.uname(&uts);
 
         const version = try utils.parseDirtySemver(&uts.release);
-        const sem_ver = SemVer {.major = 6, .minor = 8, .patch = 0};
+        const sem_ver = SemVer {.major = 6, .minor = 6, .patch = 0};
         if (version.order(sem_ver) == .lt) {
-            @panic("Linux kernel >= 6.8 is required!");
+            @panic("Linux kernel >= 6.6 is required!");
         }
 
         var p = mem.zeroes(IoUringParams);
