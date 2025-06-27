@@ -1,4 +1,4 @@
-//! # Thread Pool Module For CPU Bound Workloads - v1.0.0
+//! # Thread Pool Module For CPU Bound Workloads - v1.0.1
 //! - Multi-producer and multi-consumer (MPMC) ring buffer
 //! - Lock-free and wait-free task submission and completion
 //! - Thread per core (logical) architecture with `N` number of workers
@@ -42,6 +42,7 @@ pub fn Executor(comptime capacity: u32) type {
         const SingletonObject = struct {
             queue: MPMC(capacity),
             worker: u16,
+            pending_ios: u32,
             heap: mem.Allocator,
             mutex: Thread.Mutex,
             condition: Thread.Condition
@@ -76,6 +77,7 @@ pub fn Executor(comptime capacity: u32) type {
             Self.so = .{
                 .queue = MPMC(capacity).init(),
                 .worker = threads,
+                .pending_ios = 0,
                 .heap = if (spot) Self.gpa.?.allocator() else heap.c_allocator,
                 .mutex = Thread.Mutex{},
                 .condition = Thread.Condition{}
@@ -111,18 +113,22 @@ pub fn Executor(comptime capacity: u32) type {
         /// # Consumes and Executes a Submitted Task from the Queue
         fn tick() void {
             var sop = Self.iso();
+            const ORD = .monotonic;
 
             while(true) {
                 while (sop.queue.pop()) |data| {
                     const task: *Task = @ptrFromInt(data.entry);
                     task.handle(task.data); // Task dispatched!
                     sop.heap.destroy(task);
+
+                    _ = @atomicRmw(u32, &sop.pending_ios, .Sub, 1, ORD);
+                    if (@atomicLoad(u32, &sop.pending_ios, ORD) == 0) break;
                 }
 
                 if (Signal.iso().signal > 0) {
                     // Participant response on exit
                     const participant = &Signal.iso().participant;
-                    _ = @atomicRmw(i32, participant, .Add, 1, .monotonic);
+                    _ = @atomicRmw(i32, participant, .Add, 1, ORD);
                     break;
                 }
 
@@ -145,6 +151,7 @@ pub fn Executor(comptime capacity: u32) type {
             task.* = Task {.handle = handle, .data = data};
 
             if (sop.queue.push(@intFromPtr(task))) |_| {
+                _ = @atomicRmw(u32, &sop.pending_ios, .Add, 1, .monotonic);
                 sop.condition.signal();
                 return;
             }

@@ -1,6 +1,6 @@
 .{
     .name = .saturn,
-    .version = "0.5.0",
+    .version = "0.5.1",
     .fingerprint = 0x99424a6a5b77eeed,
     .minimum_zig_version = "0.15.0-dev.441+c1649d586",
     .dependencies = .{},
@@ -10,6 +10,6 @@
         "build.zig.zon",
         "CHANGELOG.md",
         "LICENSE",
-        "README.md"
-    }
+        "README.md",
+    },
 }
