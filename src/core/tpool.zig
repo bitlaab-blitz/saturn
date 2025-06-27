@@ -121,8 +121,8 @@ pub fn Executor(comptime capacity: u32) type {
                     task.handle(task.data); // Task dispatched!
                     sop.heap.destroy(task);
 
-                    _ = @atomicRmw(u32, &sop.pending_ios, .Sub, 1, ORD);
-                    if (@atomicLoad(u32, &sop.pending_ios, ORD) == 0) break;
+                    const ios = &sop.pending_ios;
+                    if (@atomicRmw(u32, ios, .Sub, 1, ORD) <= 1) break;
                 }
 
                 if (Signal.iso().signal > 0) {
@@ -151,7 +151,8 @@ pub fn Executor(comptime capacity: u32) type {
             task.* = Task {.handle = handle, .data = data};
 
             if (sop.queue.push(@intFromPtr(task))) |_| {
-                _ = @atomicRmw(u32, &sop.pending_ios, .Add, 1, .monotonic);
+                _ = @atomicRmw(u32, &sop.pending_ios, .Sub, 1, .monotonic);
+                //@atomicStore(u32, &sop.pending_ios, 1, .monotonic);
                 sop.condition.signal();
                 return;
             }
@@ -166,7 +167,8 @@ test "SmokeTest" {
 
     try Signal.init();
 
-    const TaskExecutor = Executor(8192);
+    // Use - `Executor(4096 * 4)`, when `TaskExecutor.init()` is false;
+    const TaskExecutor = Executor(4096);
 
     // Test Data Structure
     const Counter = struct {
