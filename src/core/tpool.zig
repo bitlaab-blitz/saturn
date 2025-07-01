@@ -91,7 +91,7 @@ pub fn Executor(comptime capacity: u32) type {
         pub fn deinit() void {
             if (Self.gpa) |_| {
                 switch (Self.gpa.?.deinit()) {
-                    .ok => process.exit(0), .leak => process.exit(1)
+                    .leak => process.exit(1), .ok => {}, // NOP
                 }
             }
         }

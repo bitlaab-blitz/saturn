@@ -118,7 +118,7 @@ pub fn AsyncIo(comptime capacity: u32) type {
             debug.assert(linux.close(@intCast(sop.ring_fd)) == 0);
             if (Self.gpa) |_| {
                 switch (Self.gpa.?.deinit()) {
-                    .ok => process.exit(0), .leak => process.exit(1)
+                    .leak => process.exit(1), .ok => {}, // NOP
                 }
             }
         }
