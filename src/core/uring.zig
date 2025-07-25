@@ -61,7 +61,8 @@ const ExitCallback = *const fn() void;
 
 /// # Singleton Asynchronous I/O Executor
 /// - `capacity` - Must be the power of two e.g., `512`, `1024`, etc.
-pub fn AsyncIo(comptime capacity: u32) type {
+/// - `TX` - An optional task executor, use **null** otherwise.
+pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
     debug.assert(std.math.isPowerOfTwo(capacity));
 
     return struct {
@@ -107,8 +108,10 @@ pub fn AsyncIo(comptime capacity: u32) type {
             const spot = detect_mem_leaks;
             if (spot) Self.gpa = std.heap.DebugAllocator(.{}).init;
 
-            const T = AsyncIo(capacity).SingletonObject;
-            Self.so = try Uring.setup(T, capacity, sfd, .{.spot_leaks = spot});
+            const T = AsyncIo(capacity, TX).SingletonObject;
+            Self.so = try Uring.setup(
+                T, TX, capacity, sfd, .{.spot_leaks = spot}
+            );
         }
 
         /// # Destroys Asynchronous I/O Instance
@@ -313,9 +316,16 @@ pub fn AsyncIo(comptime capacity: u32) type {
                     },
                     else => {
                         const p: *OpWrapper = @ptrFromInt(cqe.user_data);
-                        if (p.handle) |callback| callback(cqe.res, p.data)
-                        else {
-                            // Captures error for *null** callbacks
+
+                        if (p.handle) |cb| {
+                            if (TX == @TypeOf(null)) cb(cqe.res, p.data)
+                            else {
+                                TX.submit(.{.aio = cb}, p.data, cqe.res) catch {
+                                    cb(cqe.res, p.data); // Draining / Overflow
+                                };
+                            }
+                        } else {
+                            // Captures error for `null` callbacks
                             if (cqe.res < 0) {
                                 utils.syscallError(cqe.res, @src());
                             }
@@ -1074,10 +1084,16 @@ const Uring = struct {
     };
 
     /// # Asynchronous I/O context setup for I/O bound workloads
-    /// - `sfd` - SignalFD for the `submitWatcher()`
     /// = `cap` - Total capacity of the underlying MPSC queue
+    /// - `sfd` - SignalFD for the `submitWatcher()`
     /// - `cfg` - Additional configuration options for `io_uring` interface
-    fn setup(comptime T: type, comptime cap: u32, sfd: i32, cfg: Cfg) !T {
+    fn setup(
+        comptime T: type,
+        comptime TX: type,
+        comptime cap: u32,
+        sfd: i32,
+        cfg: Cfg
+    ) !T {
         // Ensures that the currently installed OS kernel supports
         // all `io_uring` operations that are defined in this file.
         var uts: linux.utsname = undefined;
@@ -1148,7 +1164,7 @@ const Uring = struct {
         const cq_tail: *u32 = @ptrCast(@alignCast(&mmap[p.cq_off.tail]));
         const cq_mask: *u32 = @ptrCast(@alignCast(&mmap[p.cq_off.ring_mask]));
 
-        const Aio = AsyncIo(cap);
+        const Aio = AsyncIo(cap, TX);
         const malloc = std.heap.c_allocator;
 
         return .{

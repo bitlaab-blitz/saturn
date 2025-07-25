@@ -1,10 +1,11 @@
 .{
     .name = .saturn,
-    .version = "0.5.1",
+    .version = "0.5.2",
     .fingerprint = 0x99424a6a5b77eeed,
     .minimum_zig_version = "0.15.0-dev.441+c1649d586",
     .dependencies = .{},
     .paths = .{
+        "docs",
         "src",
         "build.zig",
         "build.zig.zon",

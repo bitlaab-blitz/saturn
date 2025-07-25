@@ -22,6 +22,13 @@ Here we write upgrading notes and make them as straightforward as possible.
 - A short description for fixed item 2
 - A short description for fixed item n
 
+# [v0.5.2] - 2025-07-25
+
+Allows task executor integration on AsyncIo.
+
+### Added
+- `aio`, and `cpu` callbacks.
+
 # [v0.5.1] - 2025-06-27
 
 Less CPU consumption on internal `tick()`.

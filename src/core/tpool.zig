@@ -1,4 +1,4 @@
-//! # Thread Pool Module For CPU Bound Workloads - v1.0.1
+//! # Thread Pool Module For CPU Bound Workloads - v1.2.0
 //! - Multi-producer and multi-consumer (MPMC) ring buffer
 //! - Lock-free and wait-free task submission and completion
 //! - Thread per core (logical) architecture with `N` number of workers
@@ -29,9 +29,12 @@ const MPMC = queue.MPMC;
 
 const Error = error { Overflow, Draining };
 
-const Args = ?*anyopaque;
-const Callback = *const fn(Args) void;
-const Task = struct { handle: Callback, data: Args };
+const Callback = union(enum) {
+    cpu: *const fn(?*anyopaque) void,
+    aio: *const fn(i32, ?*anyopaque) void
+};
+
+const Task = struct { handle: Callback, data: ?*anyopaque, cqe: ?i32 };
 
 /// # Singleton Task Executor
 /// - `capacity` - Must be the power of two e.g., `512`, `1024`, etc.
@@ -118,7 +121,11 @@ pub fn Executor(comptime capacity: u32) type {
             while(true) {
                 while (sop.queue.pop()) |data| {
                     const task: *Task = @ptrFromInt(data.entry);
-                    task.handle(task.data); // Task dispatched!
+
+                    // Dynamic task dispatch
+                    if (task.cqe) |cqe| task.handle.aio(cqe, task.data)
+                    else task.handle.cpu(task.data);
+
                     sop.heap.destroy(task);
 
                     const ios = &sop.pending_ios;
@@ -143,20 +150,23 @@ pub fn Executor(comptime capacity: u32) type {
         pub fn iso() *SingletonObject { return &Self.so.?; }
 
         /// # Submits a New Task on Queue
-        pub fn submit(handle: Callback, data: Args) !void {
+        /// - `cb` - Either `.{.aio = handle}` or `.{.cpu = handle}`
+        /// - `cqe` - Return value of the CQE or userdata if needed!
+        pub fn submit(cb: Callback, data: ?*anyopaque, cqe: ?i32) !void {
             var sop = Self.iso();
             if (Signal.iso().signal > 0) return Error.Draining;
 
             const task = try sop.heap.create(Task);
-            task.* = Task {.handle = handle, .data = data};
+            if (cqe) |v| task.* = .{.handle = cb, .data = data, .cqe = v}
+            else task.* = .{.handle = cb, .data = data, .cqe = null};
 
             if (sop.queue.push(@intFromPtr(task))) |_| {
                 _ = @atomicRmw(u32, &sop.pending_ios, .Sub, 1, .monotonic);
-                //@atomicStore(u32, &sop.pending_ios, 1, .monotonic);
                 sop.condition.signal();
                 return;
             }
 
+            sop.heap.destroy(task);
             return Error.Overflow;
         }
     };
@@ -182,7 +192,7 @@ test "SmokeTest" {
     const test_limit = 1_000_000;
 
     const Job = struct {
-        fn handle(payload: Args) void {
+        fn handle(payload: ?*anyopaque) void {
             const d: *Counter = @ptrCast(@alignCast(payload));
             const value = @atomicRmw(usize, &d.value, .Add, 1, .release);
 
@@ -197,7 +207,9 @@ test "SmokeTest" {
 
         fn submit(op: *Counter) void {
             for (0..250_000) |_| {
-                TaskExecutor.submit(handle, @as(*anyopaque, op)) catch |err| {
+                const args = @as(?*anyopaque, op);
+                const task_handle: Callback = .{.cpu = handle};
+                TaskExecutor.submit(task_handle, args, null) catch |err| {
                     log.warn("{s}", .{@errorName(err)});
                 };
             }
