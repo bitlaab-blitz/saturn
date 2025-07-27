@@ -61,7 +61,7 @@ const ExitCallback = *const fn() void;
 
 /// # Singleton Asynchronous I/O Executor
 /// - `capacity` - Must be the power of two e.g., `512`, `1024`, etc.
-/// - `TX` - An optional task executor, use **null** otherwise.
+/// - `TX` - An Optional task executor, use **void** to dispatch on main thread.
 pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
     debug.assert(std.math.isPowerOfTwo(capacity));
 
@@ -318,7 +318,7 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
                         const p: *OpWrapper = @ptrFromInt(cqe.user_data);
 
                         if (p.handle) |cb| {
-                            if (TX == @TypeOf(null)) cb(cqe.res, p.data)
+                            if (TX == void) cb(cqe.res, p.data)
                             else {
                                 TX.submit(.{.aio = cb}, p.data, cqe.res) catch {
                                     cb(cqe.res, p.data); // Draining / Overflow
