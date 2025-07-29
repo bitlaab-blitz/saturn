@@ -6,7 +6,7 @@ const Signal = saturn.Signal;
 const AsyncIo = saturn.AsyncIo(512);
 const Executor = saturn.TaskExecutor(512);
 
-// To kill rouge one or more rouge processes run:
+// To kill one or more rouge processes run:
 // sudo kill -9 "$(pidof saturn | awk '{print $1}')"
 
 

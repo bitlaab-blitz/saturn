@@ -1,6 +1,6 @@
 .{
     .name = .saturn,
-    .version = "0.5.2",
+    .version = "1.0.0",
     .fingerprint = 0x99424a6a5b77eeed,
     .minimum_zig_version = "0.15.0-dev.441+c1649d586",
     .dependencies = .{},

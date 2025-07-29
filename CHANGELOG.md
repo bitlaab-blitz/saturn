@@ -22,6 +22,10 @@ Here we write upgrading notes and make them as straightforward as possible.
 - A short description for fixed item 2
 - A short description for fixed item n
 
+# [v1.0.0] - 2025-07-29
+
+A minimal barebones functionality for getting the job done.
+
 # [v0.5.2] - 2025-07-25
 
 Allows task executor integration on AsyncIo.
