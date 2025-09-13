@@ -28,7 +28,7 @@ pub fn init() !void {
 /// # Returns Internal Static Object
 pub fn iso() *SingletonObject { return &Self.so.?; }
 
-pub fn register(sig: i32) callconv(.C) void {
+pub fn register(sig: i32) callconv(.c) void {
     const fmt_str = "has been issued! Shutting down...";
     switch (sig) {
         2 => log.info("[CTRL + C] {s}", .{fmt_str}),
@@ -51,7 +51,7 @@ pub fn terminate(T: type) void {
                 log.info("Gracefully Shutdown.", .{});
                 break;
             }
-            else time.sleep(time.ns_per_ms * 500);
+            else std.Thread.sleep(time.ns_per_ms * 500);
         }
     }
 }

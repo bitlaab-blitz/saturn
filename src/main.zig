@@ -3,7 +3,7 @@ const linux = std.os.linux;
 
 const saturn = @import("saturn");
 const Signal = saturn.Signal;
-const AsyncIo = saturn.AsyncIo(512);
+const AsyncIo = saturn.AsyncIo(512, void);
 const Executor = saturn.TaskExecutor(512);
 
 // To kill one or more rouge processes run:
