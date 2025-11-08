@@ -13,6 +13,7 @@
 const std = @import("std");
 const mem = std.mem;
 const log = std.log;
+const time = std.time;
 const debug = std.debug;
 const posix = std.posix;
 const Statx = linux.Statx;
@@ -241,16 +242,16 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
                         if (Signal.iso().signal > 0) {
                             if (callbacks) |cbs| { for (cbs) |cb| cb(); }
                             Signal.Linux.signalEmit(linux.SIG.USR1);
-                            timestamp = std.time.milliTimestamp();
+                            timestamp = time.milliTimestamp();
                             sop.status = .draining;
                         }
                     },
                     .draining => {
                         Signal.Linux.signalEmit(linux.SIG.USR1);
                         const io = @atomicLoad(u32, &sop.ongoing_ios, .acquire);
-                        const delta = std.time.milliTimestamp();
+                        const delta = time.milliTimestamp();
                         if (delta - timestamp >= 100) {
-                            if (io > 1) timestamp = std.time.milliTimestamp()
+                            if (io > 1) timestamp = time.milliTimestamp()
                             else sop.status = .closed;
                         }
                     },
@@ -353,17 +354,18 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
                     Syscall.timeout(&prep, op_ptr, &d.ts, d.interval, d.mode);
                 },
                 .Timeopt => {
-                    const d: Timeopt = io.op.timeopt;
+                    const d: *Timeopt = &io.op.timeopt;
                     const target: *OpWrapper = @ptrFromInt(d.timeout_data);
-                    const p = blk: {
+                    const new_ts = blk: {
                         if (d.ts) |ts| {
-                            const ts_prt = &target.op.timeout.ts;
-                            ts_prt.* = ts; // Swaps the timespec
-                            break :blk ts_prt;
+                            target.op.timeout.ts = ts; // Overwrites timespec
+                            break :blk &target.op.timeout.ts;
                         } else break :blk null;
                     };
 
-                    Syscall.timeopt(&prep, op_ptr, p, d.timeout_data, d.mode);
+                    Syscall.timeopt(
+                        &prep, op_ptr, new_ts, d.timeout_data, d.mode
+                    );
                 },
                 .Cancel => {
                     const d: Cancel = io.op.cancel;
