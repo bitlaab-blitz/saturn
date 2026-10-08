@@ -9,6 +9,17 @@
 //! - Any thread synchronization must be managed explicitly by the App
 //! - We use `MPSC` queue wrapper for multi-threaded I/O submission to `SQE`
 //! - I/O completion `CQE` is done by the kernel and consumed by our ↻ EventLoop
+//!
+//! **Remarks:** on performance (v1.1.0, API unchanged):
+//! - `submit` is allocation-free (preallocated, cache-line padded op cells) and
+//!   syscall-free while the event loop is busy; the loop is only woken (signal)
+//!   when it is actually asleep, and only by ONE producer per sleep period
+//! - The loop publishes SQEs in batches (one `tail` store per flush) and only
+//!   enters the kernel to wake the SQPOLL thread when it asks for it
+//! - CQEs are drained in chunks (one `head` store per chunk)
+//! - Every cross-thread hot word lives on its own cache line:
+//!   producers' `queued`/`sleeping`/queues, `status`, loop-private `ongoing_ios`
+//! - Compatible with `queue.zig` v2.0.0 and `tpool.zig` v1.3.0
 
 const std = @import("std");
 const Io = std.Io;
@@ -19,7 +30,9 @@ const debug = std.debug;
 const posix = std.posix;
 const Statx = linux.Statx;
 const linux = std.os.linux;
+const atomic = std.atomic;
 const process = std.process;
+const Thread = std.Thread;
 const SemVer = std.SemanticVersion;
 const SigInfo = linux.signalfd_siginfo;
 
@@ -30,11 +43,12 @@ const Signal = @import("./signal.zig");
 
 const queue = @import("./queue.zig");
 const MPSC = queue.MPSC;
+const MPMC = queue.MPMC;
 
 
 const Error = error { Overflow, Closed };
 
-const EventLoopStatus = enum { inactive, running, draining, closed };
+const EventLoopStatus = enum(u8) { inactive, running, draining, closed };
 
 /// # I/O SQE Operation Modes
 /// - See section [5.1] and [5.2] on - https://kernel.dk/io_uring.pdf
@@ -57,6 +71,18 @@ const Channel = enum(u32) {
 const Any = ?*anyopaque;
 const ExitCallback = *const fn() void;
 
+/// Idle spins (with a CPU pause) before the event loop sleeps in the kernel
+const spin_limit: u32 = 200;
+
+/// Retries for *transient* answers of the lock-free queues (a peer that has
+/// claimed a ticket but has not published it yet makes a queue look full)
+const retry_limit: u32 = 32;
+
+/// A value that owns a whole cache line, so it can never false-share
+fn Padded(comptime T: type) type {
+    return struct { v: T align(atomic.cache_line) };
+}
+
 //##############################################################################
 //# HIGH LEVEL ASYNCHRONOUS I/O INTERFACE -------------------------------------#
 //##############################################################################
@@ -68,12 +94,19 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
     debug.assert(std.math.isPowerOfTwo(capacity));
 
     return struct {
+        /// One preallocated op cell, padded to whole cache lines so cells used
+        /// by different threads never share a line. Ops beyond `capacity`
+        /// in flight transparently spill to the heap (as in v1.0.0).
+        const Cell = struct { wrap: OpWrapper align(atomic.cache_line) };
+
         const SingletonObject = struct {
+            // Read-mostly after init (loop-only, or read by everyone)
             flags: u32,
             ring_fd: usize,
             sqes: [*]IoUringSqe,
             cqes: [*]IoUringCqe,
             sq_ring: struct {
+                head: *u32,
                 tail: *u32,
                 mask: *u32,
                 flags: *u32,
@@ -85,10 +118,23 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
                 mask: *u32
             },
             sfd: i32,
-            status: EventLoopStatus,
             heap: mem.Allocator,
+            slab: []Cell = &.{},
+
+            // Producers' hot data - each on its own cache line(s)
             queue: MPSC(capacity),
-            ongoing_ios: u32 = 0
+            /// Unused op cells (entry = address of `Cell.wrap`, never 0)
+            free: MPMC(capacity) = MPMC(capacity).init(),
+            /// Ops announced by producers but not popped by the loop yet
+            queued: Padded(u32) = .{ .v = 0 },
+            /// 0 = loop awake, 1 = loop sleeping, 2 = wake-up already requested
+            sleeping: Padded(u32) = .{ .v = 0 },
+
+            /// Written on state changes only, read by every `submit`
+            status: EventLoopStatus align(atomic.cache_line),
+
+            /// Loop-private hot counter (written on every flush/reap)
+            ongoing_ios: u32 align(atomic.cache_line) = 0
         };
 
         var so: ?SingletonObject = null;
@@ -114,13 +160,25 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
             Self.so = try Uring.setup(
                 T, TX, capacity, sfd, .{.spot_leaks = spot}
             );
+
+            // One-time allocation of every op cell the fast path will use
+            const sop = Self.iso();
+            sop.slab = try sop.heap.alloc(Cell, capacity);
+            for (sop.slab) |*cell| {
+                const pushed = sop.free.push(@intFromPtr(&cell.wrap));
+                debug.assert(pushed != null); // ring has exactly `capacity` slots
+            }
         }
 
         /// # Destroys Asynchronous I/O Instance
         pub fn deinit() void {
             const sop = Self.iso();
             sop.heap.destroy(Self.mio_pull_add.?);
-            debug.assert(linux.close(@intCast(sop.ring_fd)) == 0);
+            sop.heap.free(sop.slab);
+            sop.slab = &.{};
+
+            const rc = linux.close(@intCast(sop.ring_fd));
+            debug.assert(rc == 0);
             if (Self.gpa) |_| {
                 switch (Self.gpa.?.deinit()) {
                     .leak => process.exit(1), .ok => {}, // NOP
@@ -196,26 +254,97 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
         }
 
         /// # Returns the Current Event Loop Status
-        pub fn evlStatus() EventLoopStatus { return Self.iso().status; }
+        pub fn evlStatus() EventLoopStatus {
+            return @atomicLoad(EventLoopStatus, &Self.iso().status, .acquire);
+        }
+
+        //######################################################################
+        //# INTERNAL HELPERS --------------------------------------------------#
+        //######################################################################
+
+        /// True once a termination signal has been recorded
+        inline fn signalled() bool {
+            // Volatile read: the signal is written from outside this module
+            const sig: *const volatile @TypeOf(Signal.iso().signal) = &Signal.iso().signal;
+            return sig.* != null;
+        }
+
+        /// Short pause; every 64th round yields so a preempted peer can finish
+        inline fn relax(round: u32) void {
+            if (round & 63 == 63) {
+                Thread.yield() catch {};
+            } else {
+                atomic.spinLoopHint();
+            }
+        }
+
+        /// Takes an unused op cell, falls back to the heap when none is free
+        fn takeCell(sop: *SingletonObject) !*OpWrapper {
+            // A single attempt: `null` means "pool busy/exhausted", and the
+            // heap is always a correct (if slower) answer
+            if (sop.free.pop()) |data| return @ptrFromInt(data.entry);
+            return try sop.heap.create(OpWrapper);
+        }
+
+        /// Returns an op cell: pooled cells go back to the free list,
+        /// spilled ones go back to the heap
+        fn releaseCell(sop: *SingletonObject, p: *OpWrapper) void {
+            const addr = @intFromPtr(p);
+            const base = @intFromPtr(sop.slab.ptr);
+            const end = base + sop.slab.len * @sizeOf(Cell);
+
+            if (addr >= base and addr < end) {
+                var round: u32 = 0;
+                // Can only fail transiently: there is room for every cell
+                while (sop.free.push(addr) == null) : (round +%= 1) relax(round);
+            } else sop.heap.destroy(p);
+        }
+
+        /// Wakes the event loop - only if it is asleep, and only ONE producer
+        /// per sleep period pays for the signal. Paired with the loop's
+        /// "announce, then re-check `queued`" sequence (all seq_cst), so a
+        /// wake-up can never be lost.
+        inline fn wakeLoop(sop: *SingletonObject) void {
+            if (@atomicLoad(u32, &sop.sleeping.v, .seq_cst) != 1) return;
+            if (@cmpxchgStrong(u32, &sop.sleeping.v, 1, 2, .acq_rel, .monotonic) == null) {
+                Signal.Linux.signalEmit(linux.SIG.USR1);
+            }
+        }
 
         /// # Submits a New I/O Operation
-        fn submit(op: OpData, handle: ?OpHandler, data: ?*anyopaque) !u64 {
+        fn submit(
+            op: OpData, handle: ?OpHandler, data: ?*anyopaque
+        ) (Error || error{OutOfMemory})!u64 {
             const sop = Self.iso();
 
-            if (sop.status == .closed) return Error.Closed;
+            if (@atomicLoad(EventLoopStatus, &sop.status, .acquire) == .closed) {
+                return Error.Closed;
+            }
 
-            const io_op = try sop.heap.create(OpWrapper);
-            errdefer sop.heap.destroy(io_op);
-
+            const io_op = try Self.takeCell(sop);
             io_op.* = OpWrapper {.op = op, .handle = handle, .data = data};
 
             const entry: usize = @intFromPtr(io_op);
-            _ = sop.queue.push(entry) orelse return Error.Overflow;
 
-            // Notifies the watcher
-            Signal.Linux.signalEmit(linux.SIG.USR1);
+            // Announce BEFORE publishing so the loop never sleeps while an op
+            // is in flight (the loop re-checks `queued` after going to sleep)
+            _ = @atomicRmw(u32, &sop.queued.v, .Add, 1, .seq_cst);
 
-            return @intCast(@intFromPtr(io_op));
+            var tries: u32 = 0;
+            while (sop.queue.push(entry) == null) {
+                tries += 1;
+                if (tries >= retry_limit) {
+                    _ = @atomicRmw(u32, &sop.queued.v, .Sub, 1, .release);
+                    Self.releaseCell(sop, io_op);
+                    return Error.Overflow;
+                }
+                atomic.spinLoopHint();
+            }
+
+            // Notifies the watcher (only when it is actually asleep)
+            Self.wakeLoop(sop);
+
+            return @intCast(entry);
         }
 
         /// # Starts the I/O Event Loop for Execution
@@ -235,7 +364,7 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
             );
 
             try Self.watch();
-            sop.status = .running;
+            @atomicStore(EventLoopStatus, &sop.status, .running, .release);
 
             while(true) {
                 try Self.flush();    // For I/O submission
@@ -248,18 +377,23 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
                             if (callbacks) |cbs| { for (cbs) |cb| cb(); }
                             Signal.Linux.signalEmit(linux.SIG.USR1);
                             timestamp = Clock.now(std_io).toMilliseconds();
-                            sop.status = .draining;
+                            @atomicStore(
+                                EventLoopStatus, &sop.status, .draining, .release
+                            );
                         }
                     },
                     .draining => {
-                        Signal.Linux.signalEmit(linux.SIG.USR1);
                         const io = @atomicLoad(u32, &sop.ongoing_ios, .acquire);
                         const delta = Clock.now(std_io).toMilliseconds();
                         if (delta - timestamp >= 100) {
+                            Signal.Linux.signalEmit(linux.SIG.USR1);
                             if (io > 1)
                                 timestamp = Clock.now(std_io).toMilliseconds()
-                            else sop.status = .closed;
+                            else @atomicStore(
+                                EventLoopStatus, &sop.status, .closed, .release
+                            );
                         }
+                        Thread.yield() catch {}; // Don't burn a core while draining
                     },
                     .closed => break
                 }
@@ -279,77 +413,149 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
 
             Self.mio_pull_add = io_op;
             const entry: usize = @intFromPtr(io_op);
-            _ = sop.queue.push(entry) orelse return Error.Overflow;
+
+            _ = @atomicRmw(u32, &sop.queued.v, .Add, 1, .seq_cst);
+            if (sop.queue.push(entry) == null) {
+                _ = @atomicRmw(u32, &sop.queued.v, .Sub, 1, .release);
+                return Error.Overflow;
+            }
         }
 
         /// # Flushes Pending I/O Operations to the SQE
         /// **Remarks:** When the queue is empty, it blocks the event loop
         /// until an I/O completes or a new task is submitted via `submit()`.
         fn flush() !void {
-            var count: u32 = 0;
             const sop = Self.iso();
+            const entries = sop.sq_ring.mask.* + 1;
 
-            while(sop.queue.pop()) |op| {
+            var tail = sop.sq_ring.tail.*; // We are the only writer of `tail`
+            var head = @atomicLoad(u32, sop.sq_ring.head, .acquire);
+            var popped: u32 = 0;
+            var count: u32 = 0;
+
+            while (sop.queue.pop()) |op| {
+                popped += 1;
+
+                // SQ ring full: let the kernel thread drain it first
+                while (tail -% head >= entries) {
+                    if (count > 0) { Self.publish(tail, count); count = 0; }
+                    _ = uringEnter(
+                        sop.ring_fd, 0, 0, ENTER_SQ_WAIT | ENTER_SQ_WAKEUP
+                    );
+                    head = @atomicLoad(u32, sop.sq_ring.head, .acquire);
+                }
+
+                Self.submitToSqe(op.entry, tail);
+                tail +%= 1;
                 count += 1;
-                try Self.submitToSqe(op.entry);
             }
 
-            if (count > 0) { Self.pushSqes(count); return; }
+            if (popped > 0) _ = @atomicRmw(u32, &sop.queued.v, .Sub, popped, .release);
+
+            if (count > 0) { Self.publish(tail, count); return; }
             if (sop.status == .draining) return;
 
-            // EINTR: -4 (Interrupted system call)
-            const rv = uringEnter(sop.ring_fd, 0, 1, ENTER_GETEVENTS);
-            const res: i32 = @bitCast(@as(u32, @truncate(rv)));
-            if (res != 0 and res != -4) utils.syscallError(res, @src());
+            // Idle: spin briefly first, work usually arrives within microseconds
+            var spins: u32 = 0;
+            while (spins < spin_limit) : (spins += 1) {
+                if (@atomicLoad(u32, &sop.queued.v, .acquire) != 0) return;
+                if (Self.cqReady()) return;
+                atomic.spinLoopHint();
+            }
+
+            // Announce that we are going to sleep, THEN re-check for work. A
+            // producer bumps `queued`, then looks at `sleeping` (all seq_cst):
+            // at least one side is guaranteed to see the other.
+            @atomicStore(u32, &sop.sleeping.v, 1, .seq_cst);
+
+            if (@atomicLoad(u32, &sop.queued.v, .seq_cst) == 0 and !signalled()) {
+                // EINTR: -4 (Interrupted system call)
+                const rv = uringEnter(sop.ring_fd, 0, 1, ENTER_GETEVENTS);
+                const res: i32 = @bitCast(@as(u32, @truncate(rv)));
+                if (res != 0 and res != -4) utils.syscallError(res, @src());
+            }
+
+            @atomicStore(u32, &sop.sleeping.v, 0, .release);
+        }
+
+        /// True when the kernel has posted CQEs we have not consumed yet
+        inline fn cqReady() bool {
+            const sop = Self.iso();
+            return @atomicLoad(u32, sop.cq_ring.tail, .acquire) != sop.cq_ring.head.*;
         }
 
         /// # Consumes and Dispatches Completed I/O from CQEs
         fn reapCqes() !void {
-            while (Self.getCqe()) |cqe| {
-                // Checks multishot I/O
-                const cqe_flags = cqe.flags & CQE_F_MORE;
-                const mio = if (cqe_flags == CQE_F_MORE) true else false;
+            const sop = Self.iso();
+            var chunk: [64]IoUringCqe = undefined;
 
-                const sop = Self.iso();
-                const ptr = &sop.ongoing_ios;
-                if (!mio) _ = @atomicRmw(u32, ptr, .Sub, 1, .release);
+            while (true) {
+                var head = sop.cq_ring.head.*; // We are the only writer of `head`
+                const tail = @atomicLoad(u32, sop.cq_ring.tail, .acquire);
+                if (head == tail) return; // Ring buffer is empty
 
-                switch (cqe.user_data) {
-                    0 => if (cqe.res < 0) utils.syscallError(cqe.res, @src()),
-                    1 => {
-                        // PollAdd signal handler - Consumes the emitted signal
-                        var info = mem.zeroes(SigInfo);
-                        _ = linux.read(3, mem.asBytes(&info), @sizeOf(SigInfo));
-                    },
-                    else => {
-                        const p: *OpWrapper = @ptrFromInt(cqe.user_data);
+                // Copy a chunk out, then hand the ring space back to the kernel
+                // with a single store, before running any (slow) callback
+                var n: usize = 0;
+                while (head != tail and n < chunk.len) : (n += 1) {
+                    chunk[n] = sop.cqes[head & sop.cq_ring.mask.*];
+                    head +%= 1;
+                }
+                @atomicStore(u32, sop.cq_ring.head, head, .release);
 
-                        if (p.handle) |cb| {
-                            if (TX == void) cb(cqe.res, p.data)
-                            else {
-                                TX.submit(.{.aio = cb}, p.data, cqe.res) catch {
-                                    cb(cqe.res, p.data); // Draining / Overflow
-                                };
+                var finished: u32 = 0;
+                for (chunk[0..n]) |cqe| {
+                    // Checks multishot I/O
+                    const cqe_flags = cqe.flags & CQE_F_MORE;
+                    const mio = if (cqe_flags == CQE_F_MORE) true else false;
+                    if (!mio) finished += 1;
+
+                    switch (cqe.user_data) {
+                        0 => if (cqe.res < 0) utils.syscallError(cqe.res, @src()),
+                        1 => {
+                            // PollAdd signal handler - Consumes the emitted signal
+                            var info = mem.zeroes(SigInfo);
+                            _ = linux.read(sop.sfd, mem.asBytes(&info), @sizeOf(SigInfo));
+                        },
+                        else => {
+                            const p: *OpWrapper = @ptrFromInt(cqe.user_data);
+
+                            if (p.handle) |cb| {
+                                if (TX == void) cb(cqe.res, p.data)
+                                else {
+                                    TX.submit(.{.aio = cb}, p.data, cqe.res) catch {
+                                        cb(cqe.res, p.data); // Draining / Overflow
+                                    };
+                                }
+                            } else {
+                                // Captures error for `null` callbacks
+                                if (cqe.res < 0) {
+                                    utils.syscallError(cqe.res, @src());
+                                }
                             }
-                        } else {
-                            // Captures error for `null` callbacks
-                            if (cqe.res < 0) {
-                                utils.syscallError(cqe.res, @src());
-                            }
+
+                            if (!mio) Self.releaseCell(sop, p);
                         }
-
-                        if (!mio) sop.heap.destroy(p);
                     }
+                }
+
+                if (finished > 0) {
+                    _ = @atomicRmw(u32, &sop.ongoing_ios, .Sub, finished, .release);
                 }
             }
         }
 
-        /// # Submits an I/O to SQE
-        fn submitToSqe(entry: usize) !void {
+        /// # Fills an SQE for the Given I/O
+        /// - The SQ `array` is the identity mapping (prefilled once at setup)
+        /// - The new `tail` is published in one go by `publish()`
+        fn submitToSqe(entry: usize, tail: u32) void {
+            const sop = Self.iso();
             const io: *OpWrapper = @ptrFromInt(entry);
             const op_ptr = @as(?*anyopaque, io);
 
-            var prep = Self.prepSqe();
+            const index = tail & sop.sq_ring.mask.*;
+            var prep = PrepData {.tail = tail, .index = index, .sqe = &sop.sqes[index]};
+
             switch(OpData.code(&io.op)) {
                 .PollAdd => {
                     const d: PollAdd = io.op.poll_add;
@@ -424,57 +630,26 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
                     );
                 }
             }
-
-            try Self.updateSqe(&prep);
         }
 
-        /// # Prepares I/O Submission
-        /// - Returns a pointer to fill in an SQE for an operation
-        fn prepSqe() PrepData {
-            const sop = Self.iso();
-            const tail = sop.sq_ring.tail.*;
-            const index = tail & sop.sq_ring.mask.*;
-
-            const sqe = &sop.sqes[index];
-            return .{.tail = tail, .index = index, .sqe = sqe};
-        }
-
-        /// # Updates I/O to the SQE Entry
-        /// - Adds submission queue entry to the tail of the SQE ring buffer
-        fn updateSqe(pd: *const PrepData) !void {
+        /// # Publishes Filled SQEs to the Kernel (SQPOLL thread)
+        /// - Stores the new `tail` once for the whole batch
+        /// - Enters the kernel ONLY when the SQ thread asked to be woken
+        fn publish(tail: u32, count: u32) void {
             const sop = Self.iso();
 
-            // Only after the `SQE` has been filled
-            sop.sq_ring.array[pd.index] = pd.index;
-            sop.sq_ring.tail.* = pd.tail + 1;
-        }
+            _ = @atomicRmw(u32, &sop.ongoing_ios, .Add, count, .release);
 
-        /// # Submits Batched SQEs for Completion
-        fn pushSqes(batch_len: u32) void {
-            const sop = Self.iso();
-            const flags = sop.sq_ring.flags.*;
-            var submit_flags: u32 = ENTER_SQ_WAIT;
+            // seq_cst store = full barrier between the `tail` update and the
+            // `flags` read below (the same ordering liburing gets from a fence)
+            @atomicStore(u32, sop.sq_ring.tail, tail, .seq_cst);
 
             // Wakes up the kernel thread for I/O submission
-            if (flags & SQ_NEED_WAKEUP == SQ_NEED_WAKEUP) {
-                submit_flags |= ENTER_SQ_WAKEUP;
+            if (@atomicLoad(u32, sop.sq_ring.flags, .acquire) & SQ_NEED_WAKEUP == SQ_NEED_WAKEUP) {
+                const rv = uringEnter(sop.ring_fd, count, 0, ENTER_SQ_WAKEUP);
+                const res: isize = @bitCast(rv);
+                if (res < 0 and res != -4) @panic("Failed to push on SQE!");
             }
-
-            const rv = uringEnter(sop.ring_fd, batch_len, 0, submit_flags);
-            if (rv < 0) @panic("Failed to push on SQE!");
-
-            _ = @atomicRmw(u32, &sop.ongoing_ios, .Add, batch_len, .release);
-        }
-
-        /// # Extracts Completed CQE from CQ Ring Buffer
-        fn getCqe() ?IoUringCqe {
-            const sop = Self.iso();
-            const head = sop.cq_ring.head.*;
-            if (head == sop.cq_ring.tail.*) return null; // Ring buffer is empty
-
-            const cqe = sop.cqes[head & sop.cq_ring.mask.*];
-            sop.cq_ring.head.* = head + 1;
-            return cqe;
         }
     };
 }
@@ -1167,10 +1342,15 @@ const Uring = struct {
 
         const sqes: [*]IoUringSqe = @ptrCast(@alignCast(&sqes_mmap[0]));
 
+        const sq_head: *u32 = @ptrCast(@alignCast(&mmap[p.sq_off.head]));
         const sq_tail: *u32 = @ptrCast(@alignCast(&mmap[p.sq_off.tail]));
         const sq_mask: *u32 = @ptrCast(@alignCast(&mmap[p.sq_off.ring_mask]));
         const sq_flag: *u32 = @ptrCast(@alignCast(&mmap[p.sq_off.flags]));
         const sq_array: [*]u32 = @ptrCast(@alignCast(&mmap[p.sq_off.array]));
+
+        // The SQ index array is the identity mapping and never changes, so it
+        // is filled exactly once here instead of on every submission
+        for (0..p.sq_entries) |i| sq_array[i] = @intCast(i);
 
         const cqes: [*]IoUringCqe = @ptrCast(@alignCast(&mmap[p.cq_off.cqes]));
 
@@ -1187,6 +1367,7 @@ const Uring = struct {
             .sqes = sqes,
             .cqes = cqes,
             .sq_ring = .{
+                .head = sq_head,
                 .tail = sq_tail,
                 .mask = sq_mask,
                 .flags = sq_flag,
