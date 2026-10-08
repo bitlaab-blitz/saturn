@@ -9,7 +9,7 @@ If you are using previous release of Saturn for some reason, you can generate do
 - Now, `cd` into your release directory and run:
 
 ```sh
-mkdocs serve --dev-addr=0.0.0.0:3001
+mkdocs serve --dev-addr=0.0.0.0:8001
 ```
 
 ## Generate Code Documentation

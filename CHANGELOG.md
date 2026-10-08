@@ -25,7 +25,11 @@ Here we write upgrading notes and make them as straightforward as possible.
 
 ## [v1.2.0] - 2026-10-08
 
+Internal code refactoring, better documentation, and Zig-0.17.0 version support.
 
+### Changed
+
+- Some minor breaking changes for module functions.
 
 ## [v1.1.1] - 2026-01-09
 

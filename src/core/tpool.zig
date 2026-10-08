@@ -392,7 +392,7 @@ test "SmokeTest" {
 
     // Assumes `Signal.iso().signal` is `?std.os.linux.SIG`
     Signal.iso().signal = std.os.linux.SIG.TERM; // Mimics SIGTERM signal
-    Signal.terminate(TaskExecutor);
+    try Signal.terminate(testing.io, TaskExecutor);
 
     const result = @atomicLoad(usize, &p_counter.value, .acquire);
     try testing.expect(result == test_limit);
