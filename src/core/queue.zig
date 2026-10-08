@@ -34,7 +34,7 @@ pub fn SPMC(comptime entries: u32) type {
     return struct {
         head: u32 = 0, // cursor - push
         tail: u32 = 0, // cursor - pop
-        ring: [entries]usize = [_]usize {0} ** entries,
+        ring: [entries]usize = @splat(0),
 
         const depth = entries;
         const mask = entries - 1;
@@ -94,7 +94,7 @@ pub fn MPSC(comptime entries: u32) type {
     return struct {
         head: u32 = 0, // cursor - push
         tail: u32 = 0, // cursor - pop
-        ring: [entries]usize = [_]usize {0} ** entries,
+        ring: [entries]usize = @splat(0),
 
         const depth = entries;
         const mask = entries - 1;
@@ -150,7 +150,7 @@ pub fn MPMC(comptime entries: u32) type {
     return struct {
         head: u32 = 0, // cursor - push
         tail: u32 = 0, // cursor - pop
-        ring: [entries]usize = [_]usize {0} ** entries,
+        ring: [entries]usize = @splat(0),
 
         const depth = entries;
         const mask = entries - 1;

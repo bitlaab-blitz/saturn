@@ -1,5 +1,5 @@
 //! # Scalable Task Execution and Async I/O Core
-//! - See documentation at - https://bitlaabsaturn.web.app/
+//! - See documentation at - https://bitlaab.com/api-doc?pkg=logger
 
 pub const Signal = @import("./core/signal.zig");
 pub const AsyncIo = @import("./core/uring.zig").AsyncIo;

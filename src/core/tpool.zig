@@ -13,6 +13,7 @@
 //! - See - https://youtube.com/watch?v=HP2InVqgBFM
 
 const std = @import("std");
+const Io = std.Io;
 const mem = std.mem;
 const log = std.log;
 const heap = std.heap;
@@ -43,12 +44,13 @@ pub fn Executor(comptime capacity: u32) type {
 
     return struct {
         const SingletonObject = struct {
+            io: Io,
             queue: MPMC(capacity),
             worker: u16,
             pending_ios: u32,
             heap: mem.Allocator,
-            mutex: Thread.Mutex,
-            condition: Thread.Condition
+            mutex: Io.Mutex,
+            condition: Io.Condition
 
             // TODO:
             // e.g., var counter: usize align(std.atomic.cache_line) = 0;
@@ -63,11 +65,11 @@ pub fn Executor(comptime capacity: u32) type {
         /// # Initializes and Runs the Executor
         /// - `worker` - Threads count, uses available CPU cores when **null**.
         /// - `detect_mem_leaks` - When **true**, uses `DebugAllocator`.
-        pub fn init(worker: ?u16, detect_mem_leaks: bool) !void {
+        pub fn init(io: Io, worker: ?u16, detect_mem_leaks: bool) !void {
             if (Self.so != null) @panic("Initialize Only Once Per Process!");
 
             // Ignores `USR1` - AsyncIo emits this for I/O submission
-            var sig = [_]u6{std.os.linux.SIG.USR1};
+            var sig = [_]std.os.linux.SIG{std.os.linux.SIG.USR1};
             _ = Signal.Linux.signalMask(&sig);
 
             const cpu_threads: u16 = @intCast(try Thread.getCpuCount());
@@ -78,12 +80,13 @@ pub fn Executor(comptime capacity: u32) type {
             if (spot) Self.gpa = heap.DebugAllocator(.{}).init;
 
             Self.so = .{
+                .io = io,
                 .queue = MPMC(capacity).init(),
                 .worker = threads,
                 .pending_ios = 0,
                 .heap = if (spot) Self.gpa.?.allocator() else heap.c_allocator,
-                .mutex = Thread.Mutex{},
-                .condition = Thread.Condition{}
+                .mutex = .init,
+                .condition = .init
             };
 
             try run();
@@ -114,7 +117,7 @@ pub fn Executor(comptime capacity: u32) type {
         }
 
         /// # Consumes and Executes a Submitted Task from the Queue
-        fn tick() void {
+        fn tick() !void {
             var sop = Self.iso();
             const ORD = .monotonic;
 
@@ -132,7 +135,7 @@ pub fn Executor(comptime capacity: u32) type {
                     if (@atomicRmw(u32, ios, .Sub, 1, ORD) <= 1) break;
                 }
 
-                if (Signal.iso().signal > 0) {
+                if (Signal.iso().signal != null) {
                     // Participant response on exit
                     const participant = &Signal.iso().participant;
                     _ = @atomicRmw(i32, participant, .Add, 1, ORD);
@@ -140,9 +143,9 @@ pub fn Executor(comptime capacity: u32) type {
                 }
 
                 // Nothing to do (idle period)
-                sop.mutex.lock();
-                sop.condition.wait(&sop.mutex);
-                sop.mutex.unlock();
+                try sop.mutex.lock(sop.io);
+                try sop.condition.wait(sop.io, &sop.mutex);
+                sop.mutex.unlock(sop.io);
             }
         }
 

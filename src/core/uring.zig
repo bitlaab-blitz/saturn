@@ -11,6 +11,7 @@
 //! - I/O completion `CQE` is done by the kernel and consumed by our ↻ EventLoop
 
 const std = @import("std");
+const Io = std.Io;
 const mem = std.mem;
 const log = std.log;
 const time = std.time;
@@ -101,7 +102,7 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
         pub fn init(detect_mem_leaks: bool) !void {
             if(Self.so != null) @panic("Initialize Only Once Per Process!");
 
-            var sig = [_]u6{linux.SIG.USR1};
+            var sig = [_]linux.SIG{linux.SIG.USR1};
             const sigset = Signal.Linux.signalMask(&sig);
             const signal_fd = linux.signalfd(-1, &sigset, linux.SFD.NONBLOCK);
             const sfd: i32 = @bitCast(@as(u32, @truncate(signal_fd)));
@@ -224,6 +225,10 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
             const sop = Self.iso();
             var timestamp: i64 = undefined;
 
+            var threaded: Io.Threaded = .init_single_threaded;
+            const Clock = Io.Clock.real;
+            const std_io = threaded.io();
+
             log.info(
                 "Async I/O event loop is running on [SQ-{d} | CQ-{d}]",
                 .{sop.sq_ring.mask.* + 1, sop.cq_ring.mask.* + 1}
@@ -239,19 +244,20 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
                 switch (sop.status) {
                     .inactive => unreachable,
                     .running => {
-                        if (Signal.iso().signal > 0) {
+                        if (Signal.iso().signal != null) {
                             if (callbacks) |cbs| { for (cbs) |cb| cb(); }
                             Signal.Linux.signalEmit(linux.SIG.USR1);
-                            timestamp = time.milliTimestamp();
+                            timestamp = Clock.now(std_io).toMilliseconds();
                             sop.status = .draining;
                         }
                     },
                     .draining => {
                         Signal.Linux.signalEmit(linux.SIG.USR1);
                         const io = @atomicLoad(u32, &sop.ongoing_ios, .acquire);
-                        const delta = time.milliTimestamp();
+                        const delta = Clock.now(std_io).toMilliseconds();
                         if (delta - timestamp >= 100) {
-                            if (io > 1) timestamp = time.milliTimestamp()
+                            if (io > 1)
+                                timestamp = Clock.now(std_io).toMilliseconds()
                             else sop.status = .closed;
                         }
                     },
@@ -991,7 +997,7 @@ const IoUringSqe = extern struct {
     };
 
     /// Pack this to avoid bogus arm **OABI** complaints
-    const NestedUnion1 = packed union {
+    const NestedUnion1 = extern union {
         /// Index into fixed buffers (if used).
         buf_index: u16,
         /// For grouped buffer selection
@@ -1080,7 +1086,7 @@ const Uring = struct {
         // An existing `io_uring` ring fd. Shares the asynchronous worker thread backend of the specified `io_uring` ring, rather than create a new separate thread pool when `IORING_SETUP_ATTACH_WQ` flag is set.
         wq_fd: u32,
         // Must be initialized to zero.
-        resv: [3]u32 = [_]u32{0} ** 3,
+        resv: [3]u32 = @splat(0),
         sq_off: IoSqringOffsets,
         cq_off: IoCqringOffsets
     };
@@ -1139,17 +1145,23 @@ const Uring = struct {
             p.cq_off.cqes + p.cq_entries * @sizeOf(IoUringCqe)
         );
 
+        const prot: posix.PROT = .{.READ = true, .WRITE = true};
+        const map_flags: posix.MAP = .{.TYPE = .SHARED, .POPULATE = true};
+
         // Map in the submission and completion queue ring buffers
         // Communication happens via 2 shared kernel-user space ring buffers
         // Which can be jointly mapped with the following single `mmap()`.
-        const PROT = linux.PROT;
-        const mmap = try posix.mmap(null, size, PROT.READ | PROT.WRITE, .{.TYPE = .SHARED, .POPULATE = true}, fd, OFF_SQ_RING);
+        const mmap = try posix.mmap(
+            null, size, prot, map_flags, fd, OFF_SQ_RING
+        );
         errdefer posix.munmap(mmap);
         debug.assert(mmap.len == size);
 
         // Map in the submission queue entries array
         const sqes_size = p.sq_entries * @sizeOf(IoUringSqe);
-        const sqes_mmap = try posix.mmap(null, sqes_size, PROT.READ | PROT.WRITE, .{.TYPE = .SHARED, .POPULATE = true}, fd, OFF_SQES);
+        const sqes_mmap = try posix.mmap(
+            null, sqes_size, prot, map_flags, fd, OFF_SQES
+        );
         errdefer posix.munmap(sqes_mmap);
         debug.assert(sqes_mmap.len == sqes_size);
 

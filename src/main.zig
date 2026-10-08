@@ -10,7 +10,7 @@ const Executor = saturn.TaskExecutor(512);
 // sudo kill -9 "$(pidof saturn | awk '{print $1}')"
 
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     var gpa_mem = std.heap.DebugAllocator(.{}).init;
     defer std.debug.assert(gpa_mem.deinit() == .ok);
     // const heap = gpa_mem.allocator();
@@ -19,7 +19,7 @@ pub fn main() !void {
     Signal.Linux.signal(linux.SIG.INT, Signal.register);
     Signal.Linux.signal(linux.SIG.TERM, Signal.register);
 
-    try Executor.init(null, true);
+    try Executor.init(init.io, null, true);
     defer Executor.deinit();
 
     try AsyncIo.init(true);
@@ -29,5 +29,5 @@ pub fn main() !void {
 
     try AsyncIo.eventLoop(0, null);
 
-    Signal.terminate(Executor);
+    try Signal.terminate(init.io, Executor);
 }

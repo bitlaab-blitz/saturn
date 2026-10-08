@@ -21,8 +21,7 @@ pub fn build(b: *std.Build) void {
 
     const app = "saturn";
     const exe = b.addExecutable(.{.name = app, .root_module = main});
-
-    exe.linkLibC();
+    exe.root_module.link_libc = true;
 
     // Self importing package
     exe.root_module.addImport("saturn", pkg);

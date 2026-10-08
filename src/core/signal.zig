@@ -4,6 +4,7 @@
 //! NOTE: Only the detached threads (worker) are eligible to participate!
 
 const std = @import("std");
+const Io = std.Io;
 const fmt = std.fmt;
 const log = std.log;
 const time = std.time;
@@ -12,8 +13,8 @@ const linux = std.os.linux;
 
 
 const SingletonObject = struct {
-    signal: i32,     // External user interrupt signal
-    participant: i32 // Internal participants response
+    signal: ?linux.SIG = null,  // External user interrupt signal
+    participant: i32            // Internal participants response
 };
 
 var so: ?SingletonObject = null;
@@ -22,17 +23,17 @@ const Self = @This();
 
 pub fn init() !void {
     if (Self.so != null) @panic("Initialize Only Once Per Process!");
-    Self.so = .{.signal = 0, .participant = 0};
+    Self.so = .{.participant = 0};
 }
 
 /// # Returns Internal Static Object
 pub fn iso() *SingletonObject { return &Self.so.?; }
 
-pub fn register(sig: i32) callconv(.c) void {
+pub fn register(sig: linux.SIG) callconv(.c) void {
     const fmt_str = "has been issued! Shutting down...";
     switch (sig) {
-        2 => log.info("[CTRL + C] {s}", .{fmt_str}),
-        15 => log.info("[SIGTERM] {s}", .{fmt_str}),
+        .INT => log.info("[CTRL + C] {s}", .{fmt_str}),
+        .TERM => log.info("[SIGTERM] {s}", .{fmt_str}),
         else => @panic("Encountered an Unknown Signal")
     }
 
@@ -41,17 +42,18 @@ pub fn register(sig: i32) callconv(.c) void {
 
 /// # Graceful App Shutdown
 /// - `T` - A singleton task executor with workers and conditional broadcast.
-pub fn terminate(T: type) void {
+pub fn terminate(io: Io, T: type) !void {
     const sop = Self.iso();
-    T.iso().condition.broadcast();
+    T.iso().condition.broadcast(io);
 
-    if (sop.signal > 0) {
+    if (sop.signal != null) {
         while(true) {
             if (sop.participant == @as(i32, T.iso().worker)) {
                 log.info("Gracefully Shutdown.", .{});
                 break;
+            } else {
+                try Io.sleep(io, Io.Duration.fromMilliseconds(500), .real);
             }
-            else std.Thread.sleep(time.ns_per_ms * 500);
         }
     }
 }
@@ -64,7 +66,10 @@ pub const Linux = struct {
     ///
     /// **Remarks:** Non-Maskable signals only occur for non-recoverable errors.
     /// See - https://man7.org/linux/man-pages/man2/sigaction.2.html
-    pub fn signal(sig: u6, handler: *const fn (i32) callconv(.c) void) void {
+    pub fn signal(
+        sig: linux.SIG,
+        handler: *const fn (linux.SIG) callconv(.c) void
+    ) void {
         const sig_ign = linux.Sigaction {
             .handler = .{.handler = handler},
             .mask = linux.sigemptyset(),
@@ -76,7 +81,7 @@ pub const Linux = struct {
 
     /// # Masks the Given Sigset
     /// **Remarks:** Prevents default signal disposition for the given sigset
-    pub fn signalMask(sigs: []u6) linux.sigset_t {
+    pub fn signalMask(sigs: []const linux.SIG) linux.sigset_t {
         var sigset: linux.sigset_t = linux.sigemptyset();
         for (sigs) |sig| linux.sigaddset(&sigset, sig);
 
@@ -92,7 +97,7 @@ pub const Linux = struct {
     ///
     /// **Remarks:** Alternative to `raise(3)` syscall. As of now `raise(3)`
     /// in `std.posix` fails to send signal across thread boundaries in zig.
-    pub fn signalEmit(sig: u6) void {
+    pub fn signalEmit(sig: linux.SIG) void {
         const pid = linux.getpid();
         debug.assert(linux.kill(pid, sig) == 0);
     }

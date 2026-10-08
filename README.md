@@ -6,12 +6,12 @@ Saturn is a high-performance library offering a unified foundation for building 
 
 ## Platform Support
 
-Saturn currently supports only Linux on **aarch64** and **x86_64** architectures.
+Currently supports only Linux on **aarch64** and **x86_64** architectures.
 
 ## Dependency
 
-Saturn has no external dependencies.
+No external dependencies.
 
 ## Documentation
 
-For most up-to-date documentation see - [**Saturn Documentation**](https://bitlaabsaturn.web.app/).
+For most up-to-date documentation see - [**Saturn Documentation**](https://bitlaab.com/api-doc?pkg=saturn).
