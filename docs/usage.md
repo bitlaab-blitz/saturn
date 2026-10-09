@@ -26,20 +26,20 @@ Signal.Linux.signal(std.os.linux.SIG.INT, Signal.register);
 Signal.Linux.signal(std.os.linux.SIG.TERM, Signal.register);
 ```
 
-Signal is a singleton instance, therefore you can look out for `Signal.iso().signal` to detect the above signals from any where in your codebase.
+Signal is a singleton instance, therefore you can call `Signal.signalled()` to detect the above signals from anywhere in your codebase.
 
-Use, `Signal.terminate(Executor);` to pass exit signal to your worker threads.
+Use, `Signal.terminate(io, Executor);` to pass exit signal to your worker threads.
 
 ## Executor Setup
 
 Paste the following code in your `main.zig` file.
 
 ```zig
-try Executor.init(null, true);
+try Executor.init(init.io, null, true);
 defer Executor.deinit();
 ```
 
-The above snippet creates and runs a thread pool using available logical CPU cores. You can specify the number of workers via the first `init()` argument.
+The above snippet creates and runs a thread pool using available logical CPU cores. You can specify the number of workers via the second `init()` argument (the first is the `Io` instance).
 
 **Remarks:** If debug mode is **false**, the executor uses `malloc` for internal bookkeeping.
 
@@ -63,7 +63,7 @@ defer AsyncIo.deinit();
 To run the even loop, paste the following snippet at the end of your `main.zig`.
 
 ```zig
-try AsyncIo.eventLoop(0, .{});
+try AsyncIo.eventLoop(0, null);
 ```
 
 **Remarks:** Once called, the I/O event loop will run on the main thread!

@@ -26,6 +26,8 @@ pub fn main(init: std.process.Init) !void {
     defer AsyncIo.deinit();
 
     // Write your code here...
+    // Use `Signal.signalled()` to check for an exit signal from anywhere:
+    // if (Signal.signalled()) { ... }
 
     try AsyncIo.eventLoop(0, null);
 

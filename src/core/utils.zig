@@ -25,6 +25,13 @@ pub fn syscallError(code: i32, src: SrcLoc) void {
     log.err(fmt_str, .{code, @tagName(err), src.file, src.line});
 }
 
+/// # Spin Pause With Periodic Yield
+/// - Short pause; every 64th round yields so a preempted peer can finish
+pub inline fn relax(round: u32) void {
+    if (round & 63 == 63) std.Thread.yield() catch {}
+    else std.atomic.spinLoopHint();
+}
+
 /// # Std SemanticVersion Alternative
 /// - `std.SemanticVersion` requires there be no extra characters after the
 /// major/minor/patch numbers. But when we try to parse `uname --kernel-release`

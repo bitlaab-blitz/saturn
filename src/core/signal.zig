@@ -29,6 +29,14 @@ pub fn init() !void {
 /// # Returns Internal Static Object
 pub fn iso() *SingletonObject { return &Self.so.?; }
 
+/// # True Once a Termination Signal Has Been Recorded
+/// - The signal is written from signal-handler context, so every access goes
+///   through a volatile pointer (single aligned word, no torn reads)
+pub fn signalled() bool {
+    const sig: *volatile ?linux.SIG = &Self.so.?.signal;
+    return sig.* != null;
+}
+
 pub fn register(sig: linux.SIG) callconv(.c) void {
     const fmt_str = "has been issued! Shutting down...";
     switch (sig) {
@@ -37,7 +45,8 @@ pub fn register(sig: linux.SIG) callconv(.c) void {
         else => @panic("Encountered an Unknown Signal")
     }
 
-    Self.iso().signal = sig;
+    const signal: *volatile ?linux.SIG = &Self.iso().signal;
+    signal.* = sig;
 }
 
 /// # Graceful App Shutdown
@@ -46,15 +55,13 @@ pub fn terminate(io: Io, T: type) !void {
     const sop = Self.iso();
     T.iso().condition.broadcast(io);
 
-    if (sop.signal != null) {
-        while(true) {
-            if (sop.participant == @as(i32, T.iso().worker)) {
-                log.info("Gracefully Shutdown.", .{});
-                break;
-            } else {
-                try Io.sleep(io, Io.Duration.fromMilliseconds(500), .real);
-            }
+    if (signalled()) {
+        const expected: i32 = @intCast(T.iso().worker);
+        while (@atomicLoad(i32, &sop.participant, .acquire) != expected) {
+            try Io.sleep(io, Io.Duration.fromMilliseconds(500), .real);
         }
+
+        log.info("Gracefully Shutdown.", .{});
     }
 }
 

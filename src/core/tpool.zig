@@ -30,7 +30,8 @@
 //!   `wakeAll()` for this (`Signal.terminate` should): it broadcasts WHILE
 //!   HOLDING the park mutex, which is what makes the wake-up impossible to lose
 //!   (a bare `iso().condition.broadcast()` can slip between a worker's last
-//!   `draining()` check and its `wait` and leave that worker parked forever)
+//!   `Signal.signalled()` check and its `wait` and leave that worker parked
+//!   forever)
 
 const std = @import("std");
 const Io = std.Io;
@@ -42,6 +43,7 @@ const Thread = std.Thread;
 const process = std.process;
 const testing = std.testing;
 
+const utils = @import("./utils.zig");
 const Signal = @import("./signal.zig");
 
 const queue = @import("./queue.zig");
@@ -90,6 +92,10 @@ pub fn Executor(comptime capacity: u32) type {
             pending_ios: u32 align(line),
             /// - Number of workers parked (or about to park) on `condition`
             sleepers: u32 align(line),
+            /// - Coalesces producer wake-ups: the submit that claimed the wake
+            ///   (CAS 0->1) runs the mutex/signal handshake; concurrent
+            ///   submitters coalesce behind it instead of each paying their own
+            wake_pending: u32 align(line) = 0,
 
             // - Park/wake machinery - written only when workers park or wake
             mutex: Io.Mutex align(line),
@@ -127,6 +133,7 @@ pub fn Executor(comptime capacity: u32) type {
                 .queue = Queue.init(),
                 .pending_ios = 0,
                 .sleepers = 0,
+                .wake_pending = 0,
                 .mutex = .init,
                 .condition = .init,
                 .io = io,
@@ -161,17 +168,8 @@ pub fn Executor(comptime capacity: u32) type {
             );
         }
 
-        /// - True once a termination signal has been recorded
-        inline fn draining() bool {
-            // Volatile read: the signal is written from outside this module
-            const sig: *const volatile @TypeOf(Signal.iso().signal) = &Signal.iso().signal;
-            return sig.* != null;
-        }
-
         /// - Every 64th round yields so a preempted peer can finish
-        inline fn relax(round: u32) void {
-            if (round & 63 == 63) Thread.yield() catch {} else atomic.spinLoopHint();
-        }
+        const relax = utils.relax;
 
         /// - Undoes the effects of a submit that did not publish its task
         inline fn abort(sop: *SingletonObject) void {
@@ -180,19 +178,22 @@ pub fn Executor(comptime capacity: u32) type {
 
         /// - Wakes one parked worker. Taking the mutex guarantees the worker is
         ///   already inside `wait` (it holds the mutex from announcing itself
-        ///   until `wait` releases it), so the signal cannot be lost.
+        ///   until `wait` releases it), so the signal cannot be lost. Clears
+        ///   `wake_pending` last so the next burst of submits starts a fresh
+        ///   wake instead of being stuck behind a stale claim.
         fn wake(sop: *SingletonObject) void {
             sop.mutex.lockUncancelable(sop.io);
             sop.condition.signal(sop.io);
             sop.mutex.unlock(sop.io);
+            @atomicStore(u32, &sop.wake_pending, 0, .release);
         }
 
         /// # Wakes Every Parked Worker
         /// - Call this right after the termination signal has been set, so
         ///   that parked workers notice it, drain and exit.
         /// - Broadcasts under the park mutex: a worker that is between its last
-        ///   `draining()` check and its `wait` still holds that mutex, so this
-        ///   call blocks until it is really waiting; the wake-up can't be lost.
+        ///   `Signal.signalled()` check and its `wait` still holds that mutex,
+        ///   this call blocks until it is really waiting; wake-up can't be lost
         pub fn wakeAll() void {
             const sop = Self.iso();
             sop.mutex.lockUncancelable(sop.io);
@@ -209,7 +210,9 @@ pub fn Executor(comptime capacity: u32) type {
             sop.mutex.lockUncancelable(sop.io);
 
             _ = @atomicRmw(u32, &sop.sleepers, .Add, 1, .seq_cst);
-            if (@atomicLoad(u32, &sop.pending_ios, .seq_cst) == 0 and !draining()) {
+            if (@atomicLoad(u32, &sop.pending_ios, .seq_cst) == 0 and
+                !Signal.signalled()
+            ) {
                 sop.condition.waitUncancelable(sop.io, &sop.mutex);
             }
             _ = @atomicRmw(u32, &sop.sleepers, .Sub, 1, .monotonic);
@@ -251,7 +254,7 @@ pub fn Executor(comptime capacity: u32) type {
                     continue;
                 }
 
-                if (draining()) {
+                if (Signal.signalled()) {
                     // Participant response on exit (queue is drained)
                     const participant = &Signal.iso().participant;
                     _ = @atomicRmw(i32, participant, .Add, 1, .release);
@@ -278,14 +281,14 @@ pub fn Executor(comptime capacity: u32) type {
         /// - `cqe` - Return value of the CQE or userdata if needed!
         pub fn submit(cb: Callback, data: ?*anyopaque, cqe: ?i32) !void {
             const sop = Self.iso();
-            if (draining()) return Error.Draining;
+            if (Signal.signalled()) return Error.Draining;
 
             // 1. Announce BEFORE publishing so no worker parks while this
             // task is in flight (see `park`)
             _ = @atomicRmw(u32, &sop.pending_ios, .Add, 1, .seq_cst);
 
             // Shutdown raced with us: nothing has been published yet
-            if (draining()) {
+            if (Signal.signalled()) {
                 abort(sop);
                 return Error.Draining;
             }
@@ -302,8 +305,13 @@ pub fn Executor(comptime capacity: u32) type {
                 atomic.spinLoopHint();
             }
 
-            // 3. Wake a parked worker, only when one exists
-            if (@atomicLoad(u32, &sop.sleepers, .seq_cst) != 0) wake(sop);
+            // 3. Wake a parked worker, only when one exists. `wake_pending`
+            // coalesces bursts of submits into a single mutex/signal round-trip
+            if (@atomicLoad(u32, &sop.sleepers, .seq_cst) != 0 and
+                @cmpxchgStrong(u32, &sop.wake_pending, 0, 1, .seq_cst, .monotonic) == null)
+            {
+                wake(sop);
+            }
         }
     };
 }
@@ -311,7 +319,7 @@ pub fn Executor(comptime capacity: u32) type {
 test "layout: every field of the singleton owns its cache line(s)" {
     const S = Executor(64).SingletonObject;
     const cl = atomic.cache_line;
-    const names = .{ "queue", "pending_ios", "sleepers", "mutex", "condition", "io", "heap", "worker" };
+    const names = .{"queue", "pending_ios", "sleepers", "wake_pending", "mutex", "condition", "io", "heap", "worker"};
 
     inline for (names, 0..) |a, i| {
         const a_first = @offsetOf(S, a) / cl;
@@ -391,7 +399,8 @@ test "SmokeTest" {
     const stop = Io.Clock.awake.now(testing.io);
 
     // Assumes `Signal.iso().signal` is `?std.os.linux.SIG`
-    Signal.iso().signal = std.os.linux.SIG.TERM; // Mimics SIGTERM signal
+    const sig_ptr: *volatile ?std.os.linux.SIG = &Signal.iso().signal;
+    sig_ptr.* = .TERM; // Mimics SIGTERM signal
     try Signal.terminate(testing.io, TaskExecutor);
 
     const result = @atomicLoad(usize, &p_counter.value, .acquire);

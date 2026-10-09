@@ -32,7 +32,6 @@ const Statx = linux.Statx;
 const linux = std.os.linux;
 const atomic = std.atomic;
 const process = std.process;
-const Thread = std.Thread;
 const SemVer = std.SemanticVersion;
 const SigInfo = linux.signalfd_siginfo;
 
@@ -262,21 +261,8 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
         //# INTERNAL HELPERS --------------------------------------------------#
         //######################################################################
 
-        /// True once a termination signal has been recorded
-        inline fn signalled() bool {
-            // Volatile read: the signal is written from outside this module
-            const sig: *const volatile @TypeOf(Signal.iso().signal) = &Signal.iso().signal;
-            return sig.* != null;
-        }
-
         /// Short pause; every 64th round yields so a preempted peer can finish
-        inline fn relax(round: u32) void {
-            if (round & 63 == 63) {
-                Thread.yield() catch {};
-            } else {
-                atomic.spinLoopHint();
-            }
-        }
+        const relax = utils.relax;
 
         /// Takes an unused op cell, falls back to the heap when none is free
         fn takeCell(sop: *SingletonObject) !*OpWrapper {
@@ -296,7 +282,8 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
             if (addr >= base and addr < end) {
                 var round: u32 = 0;
                 // Can only fail transiently: there is room for every cell
-                while (sop.free.push(addr) == null) : (round +%= 1) relax(round);
+                while (sop.free.push(addr) == null) : (round +%= 1)
+                    utils.relax(round);
             } else sop.heap.destroy(p);
         }
 
@@ -373,27 +360,30 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
                 switch (sop.status) {
                     .inactive => unreachable,
                     .running => {
-                        if (Signal.iso().signal != null) {
+                        if (Signal.signalled()) {
                             if (callbacks) |cbs| { for (cbs) |cb| cb(); }
                             Signal.Linux.signalEmit(linux.SIG.USR1);
                             timestamp = Clock.now(std_io).toMilliseconds();
-                            @atomicStore(
-                                EventLoopStatus, &sop.status, .draining, .release
-                            );
+                            @atomicStore(EventLoopStatus, &sop.status, .draining, .release);
                         }
                     },
                     .draining => {
-                        const io = @atomicLoad(u32, &sop.ongoing_ios, .acquire);
-                        const delta = Clock.now(std_io).toMilliseconds();
-                        if (delta - timestamp >= 100) {
+                        const ongoing = @atomicLoad(
+                            u32, &sop.ongoing_ios, .acquire
+                        );
+                        const now = Clock.now(std_io).toMilliseconds();
+                        if (now - timestamp >= 100) {
                             Signal.Linux.signalEmit(linux.SIG.USR1);
-                            if (io > 1)
-                                timestamp = Clock.now(std_io).toMilliseconds()
-                            else @atomicStore(
-                                EventLoopStatus, &sop.status, .closed, .release
-                            );
+                            if (ongoing > 1) timestamp = now
+                            else {
+                                @atomicStore(EventLoopStatus, &sop.status, .closed, .release);
+                            }
                         }
-                        Thread.yield() catch {}; // Don't burn a core while draining
+                        // Bounded nap instead of a yield-per-iteration burn;
+                        // completions are reaped on the next pass and the
+                        // 100ms deadline granularity is unchanged
+                        Io.sleep(std_io, Io.Duration.fromMilliseconds(5), .real)
+                        catch {}; // NO-OP
                     },
                     .closed => break
                 }
@@ -468,7 +458,9 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
             // at least one side is guaranteed to see the other.
             @atomicStore(u32, &sop.sleeping.v, 1, .seq_cst);
 
-            if (@atomicLoad(u32, &sop.queued.v, .seq_cst) == 0 and !signalled()) {
+            if (@atomicLoad(u32, &sop.queued.v, .seq_cst) == 0 and
+                !Signal.signalled()
+            ) {
                 // EINTR: -4 (Interrupted system call)
                 const rv = uringEnter(sop.ring_fd, 0, 1, ENTER_GETEVENTS);
                 const res: i32 = @bitCast(@as(u32, @truncate(rv)));
@@ -556,17 +548,14 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
             const index = tail & sop.sq_ring.mask.*;
             var prep = PrepData {.tail = tail, .index = index, .sqe = &sop.sqes[index]};
 
-            switch(OpData.code(&io.op)) {
-                .PollAdd => {
-                    const d: PollAdd = io.op.poll_add;
+            switch (io.op) {
+                .poll_add => |*d| {
                     Syscall.pollAdd(&prep, d.fd, d.mask, d.mode);
                 },
-                .Timeout => {
-                    const d: *Timeout = &io.op.timeout;
+                .timeout => |*d| {
                     Syscall.timeout(&prep, op_ptr, &d.ts, d.interval, d.mode);
                 },
-                .Timeopt => {
-                    const d: *Timeopt = &io.op.timeopt;
+                .timeopt => |*d| {
                     const target: *OpWrapper = @ptrFromInt(d.timeout_data);
                     const new_ts = blk: {
                         if (d.ts) |ts| {
@@ -579,52 +568,42 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
                         &prep, op_ptr, new_ts, d.timeout_data, d.mode
                     );
                 },
-                .Cancel => {
-                    const d: Cancel = io.op.cancel;
+                .cancel => |*d| {
                     Syscall.cancel(&prep, op_ptr, d.userdata, d.mode);
                 },
-                .Accept => {
-                    const d: Accept = io.op.accept;
+                .accept => |*d| {
                     Syscall.accept(
                         &prep, op_ptr, d.fd, d.addr, d.len, d.mode
                     );
                 },
-                .Shutdown => {
-                    const d: Shutdown = io.op.shutdown;
+                .shutdown => |*d| {
                     Syscall.shutdown(&prep, op_ptr, d.fd, d.channel, d.mode);
                 },
-                .Open => {
-                    const d: Open = io.op.open;
+                .open => |*d| {
                     Syscall.open(
                         &prep, op_ptr, d.path, d.flags, d.open_mode, d.mode
                     );
                 },
-                .Close => {
-                    const d: Close = io.op.close;
+                .close => |*d| {
                     Syscall.close(&prep, op_ptr, d.fd, d.mode);
                 },
-                .Send => {
-                    const d: Send = io.op.send;
+                .send => |*d| {
                     Syscall.send(&prep, op_ptr, d.fd, d.buff, d.len, d.mode);
                 },
-                .Recv => {
-                    const d: Recv = io.op.recv;
+                .recv => |*d| {
                     Syscall.recv(&prep, op_ptr, d.fd, d.buff, d.len, d.mode);
                 },
-                .Read => {
-                    const d: Read = io.op.read;
+                .read => |*d| {
                     Syscall.read(
                         &prep, op_ptr, d.fd, d.buff, d.count, d.offset, d.mode
                     );
                 },
-                .Write => {
-                    const d: Write = io.op.write;
+                .write => |*d| {
                     Syscall.write(
                         &prep, op_ptr, d.fd, d.buff, d.count, d.offset, d.mode
                     );
                 },
-                .Status => {
-                    const d: Status = io.op.status;
+                .status => |*d| {
                     Syscall.status(
                         &prep, op_ptr, d.path, d.flags, d.mask, d.result, d.mode
                     );
@@ -645,7 +624,9 @@ pub fn AsyncIo(comptime capacity: u32, comptime TX: type) type {
             @atomicStore(u32, sop.sq_ring.tail, tail, .seq_cst);
 
             // Wakes up the kernel thread for I/O submission
-            if (@atomicLoad(u32, sop.sq_ring.flags, .acquire) & SQ_NEED_WAKEUP == SQ_NEED_WAKEUP) {
+            if (@atomicLoad(u32, sop.sq_ring.flags, .acquire) &
+                SQ_NEED_WAKEUP == SQ_NEED_WAKEUP
+            ) {
                 const rv = uringEnter(sop.ring_fd, count, 0, ENTER_SQ_WAKEUP);
                 const res: isize = @bitCast(rv);
                 if (res < 0 and res != -4) @panic("Failed to push on SQE!");
@@ -751,22 +732,6 @@ const Status = struct {
 /// - Capture that new I/O operation in `submitToSqe()`'s switch prong
 /// - Add `io_uring` syscall implementation at the `Syscall` structure
 const OpData = union(enum) {
-    const Op = enum {
-        PollAdd,
-        Timeout,
-        Timeopt,
-        Cancel,
-        Accept,
-        Shutdown,
-        Open,
-        Close,
-        Send,
-        Recv,
-        Read,
-        Write,
-        Status
-    };
-
     poll_add: PollAdd,
     timeout:  Timeout,
     timeopt:  Timeopt,
@@ -779,25 +744,7 @@ const OpData = union(enum) {
     recv:     Recv,
     read:     Read,
     write:    Write,
-    status:   Status,
-
-    fn code(self: *OpData) Op {
-        return switch (self.*) {
-            .poll_add => .PollAdd,
-            .timeout =>  .Timeout,
-            .timeopt =>  .Timeopt,
-            .cancel =>   .Cancel,
-            .accept =>   .Accept,
-            .shutdown => .Shutdown,
-            .open =>     .Open,
-            .close =>    .Close,
-            .send =>     .Send,
-            .recv =>     .Recv,
-            .read =>     .Read,
-            .write =>    .Write,
-            .status =>   .Status
-        };
-    }
+    status:   Status
 };
 
 const OpHandler = *const fn(cqe_res: i32, userdata: ?*anyopaque) void;
@@ -810,19 +757,34 @@ const OpWrapper = struct { op: OpData, handle: ?OpHandler, data: ?*anyopaque };
 const PrepData = struct { tail: u32, index: u32, sqe: *IoUringSqe };
 
 const Syscall = struct {
-    /// # Issues the io_uring `poll_add` Operation
-    /// - Set `POLL_ADD_MULTI` in `pd.sqe.len` field for multishot
-    fn pollAdd(pd: *PrepData, fd: i32, poll_mask: u32, io_mode: Mode) void {
-        pd.sqe.opcode = linux.IORING_OP.POLL_ADD;
+    /// # Common SQE Preamble
+    /// - Fields every prep function sets identically; op-specific fields
+    ///   (`len`, the `union_1..3` views, `ioprio` overrides) are set after
+    fn prepBase(
+        pd: *PrepData,
+        opcode: linux.IORING_OP,
+        fd: i32,
+        io_mode: Mode,
+        p: ?*anyopaque
+    ) void {
+        pd.sqe.opcode = opcode;
         pd.sqe.fd = fd;
         pd.sqe.flags = @intFromEnum(io_mode);
         pd.sqe.ioprio = 0;
         pd.sqe.union_1.off = 0;
         pd.sqe.union_2.addr = 0;
+        pd.sqe.len = 0;
+        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
+        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
+    }
+
+    /// # Issues the io_uring `poll_add` Operation
+    /// - Set `POLL_ADD_MULTI` in `pd.sqe.len` field for multishot
+    fn pollAdd(pd: *PrepData, fd: i32, poll_mask: u32, io_mode: Mode) void {
+        prepBase(pd, .POLL_ADD, fd, io_mode, null);
+        pd.sqe.user_data = 1; // Consumed by the `PollAdd` prong in `reapCqes`
         pd.sqe.len = POLL_ADD_MULTI;
         pd.sqe.union_3.rw_flags = std.mem.nativeToLittle(u32, poll_mask);
-        pd.sqe.user_data = 1;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the io_uring `timeout` Operation
@@ -834,16 +796,11 @@ const Syscall = struct {
         ic: ?u64, // interval count
         io_mode: Mode
     ) void {
-        pd.sqe.opcode = linux.IORING_OP.TIMEOUT;
-        pd.sqe.fd = 0;
-        pd.sqe.flags = @intFromEnum(io_mode);
-        pd.sqe.ioprio = 0;
+        prepBase(pd, .TIMEOUT, 0, io_mode, p);
         pd.sqe.union_1.off = ic orelse 0;
         pd.sqe.union_2.addr = @intFromPtr(ts);
         pd.sqe.len = 1;
         pd.sqe.union_3.timeout_flags = if (ic != null) TIMEOUT_MULTISHOT else 0;
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the io_uring `timeout_remove` Operation
@@ -855,16 +812,10 @@ const Syscall = struct {
         timeout_data: u64,
         io_mode: Mode
     ) void {
-        pd.sqe.opcode = linux.IORING_OP.TIMEOUT_REMOVE;
-        pd.sqe.fd = 0;
-        pd.sqe.flags = @intFromEnum(io_mode);
-        pd.sqe.ioprio = 0;
+        prepBase(pd, .TIMEOUT_REMOVE, 0, io_mode, p);
         pd.sqe.union_1.addr2 = @intFromPtr(ts);
         pd.sqe.union_2.addr = timeout_data;
-        pd.sqe.len = 0;
         pd.sqe.union_3.timeout_flags = if (ts != null) TIMEOUT_UPDATE else 0;
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the io_uring `async_cancel` Operation
@@ -875,16 +826,9 @@ const Syscall = struct {
         userdata: u64,
         io_mode: Mode
     ) void {
-        pd.sqe.opcode = linux.IORING_OP.ASYNC_CANCEL;
-        pd.sqe.fd = 0;
-        pd.sqe.flags = @intFromEnum(io_mode);
-        pd.sqe.ioprio = 0;
-        pd.sqe.union_1.off = 0;
+        prepBase(pd, .ASYNC_CANCEL, 0, io_mode, p);
         pd.sqe.union_2.addr = userdata;
-        pd.sqe.len = 0;
         pd.sqe.union_3.rw_flags = 0;
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the Equivalent of a `accept4(2)` Syscall
@@ -898,16 +842,11 @@ const Syscall = struct {
         addrlen: *linux.socklen_t,
         io_mode: Mode
     ) void {
-        pd.sqe.opcode = linux.IORING_OP.ACCEPT;
-        pd.sqe.fd = sock_fd;
-        pd.sqe.flags = @intFromEnum(io_mode);
+        prepBase(pd, .ACCEPT, sock_fd, io_mode, p);
         pd.sqe.ioprio = ACCEPT_MULTISHOT;
         pd.sqe.union_1.addr2 = @intFromPtr(addrlen);
         pd.sqe.union_2.addr = @intFromPtr(addr);
-        pd.sqe.len = 0;
         pd.sqe.union_3.accept_flags = 0;
-        pd.sqe.user_data = @intFromPtr(p);
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the Equivalent of a `shutdown(2)` Syscall
@@ -919,16 +858,9 @@ const Syscall = struct {
         channel: Channel,
         io_mode: Mode
     ) void {
-        pd.sqe.opcode = linux.IORING_OP.SHUTDOWN;
-        pd.sqe.fd = sock_fd;
-        pd.sqe.flags = @intFromEnum(io_mode);
-        pd.sqe.ioprio = 0;
-        pd.sqe.union_1.off = 0;
-        pd.sqe.union_2.addr = 0;
-        pd.sqe.len =  @intFromEnum(channel);
+        prepBase(pd, .SHUTDOWN, sock_fd, io_mode, p);
+        pd.sqe.len = @intFromEnum(channel);
         pd.sqe.union_3.rw_flags = 0;
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the Equivalent of a `openat(2)` Syscall
@@ -942,32 +874,18 @@ const Syscall = struct {
         mode: linux.mode_t,
         io_mode: Mode
     ) void {
-        pd.sqe.opcode = linux.IORING_OP.OPENAT;
-        pd.sqe.fd = 0; // Only when given path is an absolute file path
-        pd.sqe.flags = @intFromEnum(io_mode);
-        pd.sqe.ioprio = 0;
-        pd.sqe.union_1.off = 0;
+        prepBase(pd, .OPENAT, 0, io_mode, p);
         pd.sqe.union_2.addr = @intFromPtr(path.ptr);
         pd.sqe.len = @as(u32, @intCast(mode));
         pd.sqe.union_3.open_flags = @bitCast(flags);
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the Equivalent of a `close(2)` Syscall
     /// - See - https://man7.org/linux/man-pages/man2/close.2.html
     /// - Set the `flags` field of `close(2)` in `sqe.union_3.msg_flags`
     fn close(pd: *PrepData, p: ?*anyopaque, fd: i32, io_mode: Mode) void {
-        pd.sqe.opcode = linux.IORING_OP.CLOSE;
-        pd.sqe.fd = fd;
-        pd.sqe.flags = @intFromEnum(io_mode);
-        pd.sqe.ioprio = 0;
-        pd.sqe.union_1.off = 0;
-        pd.sqe.union_2.addr = 0;
-        pd.sqe.len = 0;
+        prepBase(pd, .CLOSE, fd, io_mode, p);
         pd.sqe.union_3.msg_flags = 0;
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the Equivalent of a `send(2)` Syscall
@@ -981,16 +899,10 @@ const Syscall = struct {
         len: usize,
         io_mode: Mode
     ) void {
-        pd.sqe.opcode = linux.IORING_OP.SEND;
-        pd.sqe.fd = fd;
-        pd.sqe.flags = @intFromEnum(io_mode);
-        pd.sqe.ioprio = 0;
-        pd.sqe.union_1.off = 0;
+        prepBase(pd, .SEND, fd, io_mode, p);
         pd.sqe.union_2.addr = @intFromPtr(buff.ptr);
         pd.sqe.len = @as(u32, @intCast(len));
         pd.sqe.union_3.msg_flags = 0;
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the Equivalent of a `recv(2)` Syscall
@@ -1004,16 +916,11 @@ const Syscall = struct {
         len: usize,
         io_mode: Mode
     ) void {
-        pd.sqe.opcode = linux.IORING_OP.RECV;
-        pd.sqe.fd = fd;
-        pd.sqe.flags = @intFromEnum(io_mode);
+        prepBase(pd, .RECV, fd, io_mode, p);
         pd.sqe.ioprio = RECVSEND_POLL_FIRST;
-        pd.sqe.union_1.off = 0;
         pd.sqe.union_2.addr = @intFromPtr(buff.ptr);
         pd.sqe.len = @as(u32, @intCast(len));
         pd.sqe.union_3.msg_flags = 0;
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the Equivalent of a `pread(2)` Syscall
@@ -1029,16 +936,11 @@ const Syscall = struct {
         offset: usize,
         io_mode: Mode
     ) void {
-        pd.sqe.opcode = linux.IORING_OP.READ;
-        pd.sqe.fd = fd;
-        pd.sqe.flags = @intFromEnum(io_mode);
-        pd.sqe.ioprio = 0;
+        prepBase(pd, .READ, fd, io_mode, p);
         pd.sqe.union_1.off = offset;
         pd.sqe.union_2.addr = @intFromPtr(buff.ptr);
         pd.sqe.len = @as(u32, @intCast(count));
         pd.sqe.union_3.rw_flags = 0;
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the Equivalent of a `pwrite(2)` Syscall
@@ -1054,16 +956,11 @@ const Syscall = struct {
         offset: usize,
         io_mode: Mode
     ) void {
-        pd.sqe.opcode = linux.IORING_OP.WRITE;
-        pd.sqe.fd = fd;
-        pd.sqe.flags = @intFromEnum(io_mode);
-        pd.sqe.ioprio = 0;
+        prepBase(pd, .WRITE, fd, io_mode, p);
         pd.sqe.union_1.off = offset;
         pd.sqe.union_2.addr = @intFromPtr(buff.ptr);
         pd.sqe.len = @as(u32, @intCast(count));
         pd.sqe.union_3.rw_flags = 0;
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 
     /// # Issues the Equivalent of a `statx(2)` Syscall
@@ -1078,16 +975,11 @@ const Syscall = struct {
         result: *Statx,
         io_mode: Mode
     ) void {
-        pd.sqe.opcode = linux.IORING_OP.STATX;
-        pd.sqe.fd = 0; // Only when given path is an absolute file path
-        pd.sqe.flags = @intFromEnum(io_mode);
-        pd.sqe.ioprio = 0;
+        prepBase(pd, .STATX, 0, io_mode, p);
         pd.sqe.union_1.off = @intFromPtr(result);
         pd.sqe.union_2.addr = @intFromPtr(path.ptr);
         pd.sqe.len = mask;
         pd.sqe.union_3.statx_flags = @bitCast(flags);
-        pd.sqe.user_data = if (p) |data| @intFromPtr(data) else 0;
-        pd.sqe.union_4.__pad2 = [3]u64{0, 0, 0};
     }
 };
 
